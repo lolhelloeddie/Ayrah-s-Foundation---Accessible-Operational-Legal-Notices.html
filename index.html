@@ -674,20 +674,14 @@ footer .linklike{padding:.6rem .7rem;min-height:44px}
    demo mode (data stays in this preview only; any email and password work).
    The publishable key is safe in public code because of the row level security in the
    SQL above. NEVER paste a secret or service_role key here. */
-const SUPABASE_URL = "";  // e.g. "https://abcdefgh.supabase.co"
-const SUPABASE_KEY = "";  // starts with sb_publishable_ (legacy anon key also works)
+const SUPABASE_URL = "";  // https://cstqlohludnujnklpikj.supabase.co
+const SUPABASE_KEY = "";  // sb_publishable_aYuxNAxTQX3j4slP9XbYWg_ge4UTaiV
 const LIVE = !!(SUPABASE_URL && SUPABASE_KEY);
 
 /* ================= HELPERS ================= */
 const $=(s,r=document)=>r.querySelector(s);
 const $$=(s,r=document)=>Array.from(r.querySelectorAll(s));
-const esc=s=>String(s==null?'':s).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
-const uuid=()=>crypto.randomUUID?crypto.randomUUID():'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g,c=>{const r=crypto.getRandomValues(new Uint8Array(1))[0]&15;return(c==='x'?r:(r&3|8)).toString(16)});
-const todayStr=()=>new Date().toLocaleDateString('en-CA');
-const fmt=(iso,t)=>{const d=new Date(iso);return isNaN(d)?'':d.toLocaleString(undefined,t?{dateStyle:'medium',timeStyle:'short'}:{dateStyle:'medium'})};
-const fmtDay=s=>new Date(s+'T00:00:00').toLocaleDateString(undefined,{month:'short',day:'numeric'});
-const ago=iso=>{const n=Math.floor((Date.now()-new Date(iso))/864e5);return n<=0?'today':n===1?'1 day ago':n+' days ago'};
-const newest=(a,b)=>b.created_at.localeCompare(a.created_at), oldest=(a,b)=>a.created_at.localeCompare(b.created_at);
+const esc=s=>String(s==null?'':s).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c])d_at);
 const emailRe=/^[^\s@]+@[^\s@]+\.[^\s@]{2,}$/;
 const isEmail=x=>!!x&&emailRe.test(x);
 const ext=n=>(String(n).split('.').pop()||'').toLowerCase();
