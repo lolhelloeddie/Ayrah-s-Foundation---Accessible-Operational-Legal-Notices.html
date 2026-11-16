@@ -1,0 +1,1385 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Apply for Help – Ayrah's Foundation</title>
+
+<!--
+================================================================
+AYRAH'S FOUNDATION: HELP APPLICATIONS, APPLICANT PORTAL, STAFF PIPELINE
+Everything is in this one file:
+  your-file.html          Apply for help (applicants sign in or create an account first)
+  your-file.html#portal   My case: case number, status, updates, upload requested documents
+  your-file.html#staff    Staff pipeline (staff accounts only)
+
+SETUP (Supabase, same project as your other forms)
+1. Authentication > Users > Add user: create YOUR staff login first (tick Auto Confirm User).
+2. Authentication > Sign In / Providers: turn ON "Allow new users to sign up". Applicants need it.
+   (This reverses the earlier advice. It is safe because the rules below let applicants see only
+   their own case, and staff are identified by user ID, not by email.)
+   Leave "Confirm email" OFF to start. See the email note below.
+3. SQL Editor: edit the staff email in Part 2, then run Part 1 (only if you created the earlier form
+   tables), then Part 2. Part 2 is safe on a fresh project or on top of the earlier version.
+   Afterwards run:  select count(*) from public.staff_users;   It should return 1 or more.
+   If it returns 0, the email did not match a user. Create the login first, then re-run the INSERT.
+4. Paste your Project URL and publishable key into SUPABASE_URL and SUPABASE_KEY near the bottom.
+5. Host the file. Test end to end: create an applicant account, apply, sign in as staff at #staff,
+   request a document, then upload it from My case.
+
+EMAIL NOTE: Supabase's built-in email only sends to your own team members, so with Confirm email OFF
+accounts work without any email. Password resets and email confirmation need custom SMTP
+(Authentication > Emails > SMTP Settings). Until then, staff can reset a password in Authentication > Users.
+NEVER put a secret or service_role key in this file.
+
+================================================================
+PART 1 (OPTIONAL): GRANTS FOR THE EARLIER FORM TABLES
+Skip this part if you never created those tables.
+
+grant insert on public.volunteers, public.donation_pledges, public.supply_donations,
+  public.contact_messages, public.help_requests to anon;
+grant usage on sequence public.volunteers_id_seq, public.donation_pledges_id_seq,
+  public.supply_donations_id_seq, public.contact_messages_id_seq,
+  public.help_requests_id_seq to anon;
+
+================================================================
+PART 2: TABLES, STAFF ACCESS, DOCUMENT STORAGE, AND SECURITY
+
+create sequence if not exists public.case_number_seq start 1001;
+
+create table if not exists public.applications (
+  id uuid primary key default gen_random_uuid(),
+  created_at timestamptz not null default now(),
+  updated_at timestamptz not null default now(),
+  case_number text,
+  applicant_id uuid references auth.users(id) on delete set null,
+  full_name text not null check (char_length(full_name) between 1 and 200),
+  preferred_name text check (char_length(preferred_name) <= 200),
+  language text check (char_length(language) <= 40),
+  contact_method text not null check (char_length(contact_method) <= 60),
+  phone text check (char_length(phone) <= 40),
+  email text check (char_length(email) <= 254),
+  contact_notes text check (char_length(contact_notes) <= 1000),
+  area text not null check (char_length(area) between 1 and 300),
+  sleeping_location text check (char_length(sleeping_location) <= 80),
+  homeless_duration text check (char_length(homeless_duration) <= 60),
+  household_adults int check (household_adults between 0 and 30),
+  household_children int check (household_children between 0 and 30),
+  unsafe_now boolean not null default false,
+  pets jsonb not null default '[]'::jsonb
+    check (case when jsonb_typeof(pets) = 'array'
+           then jsonb_array_length(pets) <= 10 and pg_column_size(pets) < 20000
+           else false end),
+  needs text[] not null default '{}' check (cardinality(needs) <= 12),
+  needs_detail text check (char_length(needs_detail) <= 3000),
+  accommodations text check (char_length(accommodations) <= 1500),
+  consent boolean not null check (consent = true),
+  stage text not null default 'new'
+    check (stage in ('new','contacting','screening','active','housing','followup','closed')),
+  priority text not null default 'normal' check (priority in ('urgent','high','normal')),
+  assigned_to text,
+  next_followup date,
+  closed_reason text,
+  closed_at timestamptz
+);
+alter table public.applications add column if not exists case_number text;
+alter table public.applications add column if not exists applicant_id uuid references auth.users(id) on delete set null;
+update public.applications
+  set case_number = 'AYR-' || to_char(created_at, 'YY') || '-' || nextval('public.case_number_seq')::text
+  where case_number is null;
+alter table public.applications alter column case_number set not null;
+create unique index if not exists applications_case_number_key on public.applications (case_number);
+create index if not exists applications_applicant_idx on public.applications (applicant_id);
+create index if not exists applications_stage_priority_created_at_idx on public.applications (stage, priority, created_at);
+
+create table if not exists public.application_notes (
+  id bigint generated always as identity primary key,
+  application_id uuid not null references public.applications(id) on delete cascade,
+  created_at timestamptz not null default now(),
+  author text,
+  kind text not null default 'note' check (kind in ('note','contact_attempt','referral','service','update')),
+  body text not null check (char_length(body) between 1 and 5000)
+);
+alter table public.application_notes add column if not exists visible_to_applicant boolean not null default false;
+create index if not exists application_notes_application_id_created_at_idx on public.application_notes (application_id, created_at desc);
+
+create table if not exists public.document_requests (
+  id uuid primary key default gen_random_uuid(),
+  application_id uuid not null references public.applications(id) on delete cascade,
+  title text not null check (char_length(title) between 1 and 200),
+  instructions text check (char_length(instructions) <= 1000),
+  due_date date,
+  status text not null default 'requested'
+    check (status in ('requested','received','accepted','needs_new','cancelled')),
+  created_by uuid default auth.uid(),
+  created_at timestamptz not null default now(),
+  updated_at timestamptz not null default now()
+);
+create index if not exists document_requests_app_idx on public.document_requests (application_id, status);
+
+create table if not exists public.application_documents (
+  id uuid primary key default gen_random_uuid(),
+  application_id uuid not null references public.applications(id) on delete cascade,
+  request_id uuid not null references public.document_requests(id) on delete cascade,
+  file_path text not null check (char_length(file_path) <= 400),
+  file_name text not null check (char_length(file_name) <= 200),
+  content_type text check (char_length(content_type) <= 100),
+  size_bytes bigint check (size_bytes between 0 and 10485760),
+  uploaded_by uuid default auth.uid(),
+  created_at timestamptz not null default now()
+);
+create index if not exists application_documents_app_idx on public.application_documents (application_id, request_id);
+
+/* Staff are identified by user ID. Edit the email, add one INSERT per team member. */
+create table if not exists public.staff_users (
+  user_id uuid primary key references auth.users(id) on delete cascade
+);
+insert into public.staff_users (user_id)
+  select id from auth.users where lower(email) = lower('you@example.org')
+  on conflict do nothing;
+alter table public.staff_users enable row level security;
+revoke all on public.staff_users from anon, authenticated;
+
+create or replace function public.is_staff() returns boolean
+language sql stable security definer set search_path = public as $$
+  select exists (select 1 from public.staff_users where user_id = auth.uid());
+$$;
+create or replace function public.owns_application(p_id text) returns boolean
+language sql stable security definer set search_path = public as $$
+  select exists (select 1 from public.applications where id::text = p_id and applicant_id = auth.uid());
+$$;
+create or replace function public.can_upload(p_app text, p_req text) returns boolean
+language sql stable security definer set search_path = public as $$
+  select exists (
+    select 1 from public.document_requests r
+    join public.applications a on a.id = r.application_id
+    where r.id::text = p_req and a.id::text = p_app and a.applicant_id = auth.uid()
+      and r.status in ('requested','received','needs_new'));
+$$;
+revoke execute on function public.is_staff(), public.owns_application(text),
+  public.can_upload(text, text) from public, anon;
+grant execute on function public.is_staff(), public.owns_application(text),
+  public.can_upload(text, text) to authenticated;
+drop table if exists public.staff;
+
+/* Server-side rules: case numbers and ownership are assigned here, never by the browser. */
+create or replace function public.application_before_insert() returns trigger
+language plpgsql security definer set search_path = public as $$
+begin
+  new.created_at := now(); new.updated_at := now();
+  new.case_number := 'AYR-' || to_char(now(), 'YY') || '-' || nextval('public.case_number_seq')::text;
+  new.applicant_id := auth.uid();
+  new.stage := 'new'; new.assigned_to := null; new.next_followup := null;
+  new.closed_reason := null; new.closed_at := null;
+  new.priority := case
+    when new.unsafe_now then 'urgent'
+    when 'Shelter' = any(new.needs)
+         and new.sleeping_location in ('Outside','Vehicle','Tent or encampment') then 'high'
+    else 'normal' end;
+  return new;
+end $$;
+drop trigger if exists application_before_insert on public.applications;
+create trigger application_before_insert before insert on public.applications
+  for each row execute function public.application_before_insert();
+
+create or replace function public.application_before_update() returns trigger
+language plpgsql as $$
+begin
+  new.updated_at := now();
+  if new.stage = 'closed' and old.stage <> 'closed' then new.closed_at := now(); end if;
+  if new.stage <> 'closed' then new.closed_at := null; new.closed_reason := null; end if;
+  return new;
+end $$;
+drop trigger if exists application_before_update on public.applications;
+create trigger application_before_update before update on public.applications
+  for each row execute function public.application_before_update();
+
+create or replace function public.bump_application() returns trigger
+language plpgsql security definer set search_path = public as $$
+begin
+  update public.applications set updated_at = now() where id = new.application_id;
+  return new;
+end $$;
+drop trigger if exists bump_on_request on public.document_requests;
+create trigger bump_on_request after insert on public.document_requests
+  for each row execute function public.bump_application();
+drop trigger if exists bump_on_shared_note on public.application_notes;
+create trigger bump_on_shared_note after insert on public.application_notes
+  for each row when (new.visible_to_applicant) execute function public.bump_application();
+
+create or replace function public.document_uploaded() returns trigger
+language plpgsql security definer set search_path = public as $$
+begin
+  update public.document_requests set status = 'received', updated_at = now()
+    where id = new.request_id and status in ('requested','needs_new');
+  update public.applications set updated_at = now() where id = new.application_id;
+  return new;
+end $$;
+drop trigger if exists document_uploaded on public.application_documents;
+create trigger document_uploaded after insert on public.application_documents
+  for each row execute function public.document_uploaded();
+
+/* What applicants may see: only their own case, and only fields meant for them.
+   These views intentionally run as the table owner and filter by auth.uid(). */
+create or replace view public.my_cases as
+  select id, case_number, created_at, updated_at, stage, full_name, preferred_name, needs
+  from public.applications where applicant_id = auth.uid();
+create or replace view public.my_updates as
+  select n.id, n.application_id, n.created_at, n.body
+  from public.application_notes n join public.applications a on a.id = n.application_id
+  where n.visible_to_applicant and a.applicant_id = auth.uid();
+
+/* Row level security */
+alter table public.applications enable row level security;
+alter table public.application_notes enable row level security;
+alter table public.document_requests enable row level security;
+alter table public.application_documents enable row level security;
+
+drop policy if exists "public can apply" on public.applications;
+drop policy if exists "applicants can apply" on public.applications;
+create policy "applicants can apply" on public.applications
+  for insert to authenticated
+  with check (applicant_id = auth.uid() and consent = true and stage = 'new');
+drop policy if exists "staff read applications" on public.applications;
+create policy "staff read applications" on public.applications
+  for select to authenticated using (public.is_staff());
+drop policy if exists "staff update applications" on public.applications;
+create policy "staff update applications" on public.applications
+  for update to authenticated using (public.is_staff()) with check (public.is_staff());
+
+drop policy if exists "staff read notes" on public.application_notes;
+create policy "staff read notes" on public.application_notes
+  for select to authenticated using (public.is_staff());
+drop policy if exists "staff add notes" on public.application_notes;
+create policy "staff add notes" on public.application_notes
+  for insert to authenticated with check (public.is_staff());
+
+drop policy if exists "staff manage requests" on public.document_requests;
+create policy "staff manage requests" on public.document_requests
+  for all to authenticated using (public.is_staff()) with check (public.is_staff());
+drop policy if exists "owners read requests" on public.document_requests;
+create policy "owners read requests" on public.document_requests
+  for select to authenticated using (public.owns_application(application_id::text));
+
+drop policy if exists "owners add documents" on public.application_documents;
+create policy "owners add documents" on public.application_documents
+  for insert to authenticated
+  with check (public.can_upload(application_id::text, request_id::text)
+              and file_path like application_id::text || '/%');
+drop policy if exists "owners and staff read documents" on public.application_documents;
+create policy "owners and staff read documents" on public.application_documents
+  for select to authenticated
+  using (public.is_staff() or public.owns_application(application_id::text));
+
+/* Grants (least privilege). Staff can change only pipeline columns, never the applicant's answers. */
+revoke all on public.applications, public.application_notes, public.document_requests,
+  public.application_documents, public.my_cases, public.my_updates from anon, authenticated;
+grant insert, select on public.applications to authenticated;
+grant update (stage, priority, assigned_to, next_followup, closed_reason) on public.applications to authenticated;
+grant select, insert on public.application_notes to authenticated;
+grant select, insert, update on public.document_requests to authenticated;
+grant select, insert on public.application_documents to authenticated;
+grant select on public.my_cases, public.my_updates to authenticated;
+grant usage on sequence public.application_notes_id_seq to authenticated;
+
+/* Private document storage: 10 MB per file, PDFs and photos only. Path is applicationId/requestId/file. */
+insert into storage.buckets (id, name, public, file_size_limit, allowed_mime_types)
+values ('case-documents', 'case-documents', false, 10485760,
+        array['application/pdf','image/jpeg','image/png','image/webp','image/heic','image/heif'])
+on conflict (id) do update set public = false,
+  file_size_limit = excluded.file_size_limit, allowed_mime_types = excluded.allowed_mime_types;
+
+drop policy if exists "applicants upload requested documents" on storage.objects;
+create policy "applicants upload requested documents" on storage.objects
+  for insert to authenticated
+  with check (bucket_id = 'case-documents'
+              and public.can_upload((storage.foldername(name))[1], (storage.foldername(name))[2]));
+drop policy if exists "owners and staff read documents" on storage.objects;
+create policy "owners and staff read documents" on storage.objects
+  for select to authenticated
+  using (bucket_id = 'case-documents'
+         and (public.is_staff() or public.owns_application((storage.foldername(name))[1])));
+================================================================
+BEFORE LAUNCH: fill in the yellow blanks (class "todo") in the footer and privacy notice.
+-->
+
+<style>
+:root{--primary:#4338a0;--primary-dark:#2f2778;--accent:#b45309;--text:#1f2937;--muted:#4b5563;--soft:#f3f4fb;--focus:#ffbf47;--error:#b91c1c;--ok:#166534;--line:#cbd0d8}
+*{margin:0;padding:0;box-sizing:border-box}
+[hidden]{display:none!important}
+html{scroll-behavior:smooth;scroll-padding-top:80px}
+body{font-family:system-ui,-apple-system,"Segoe UI",Roboto,Arial,sans-serif;line-height:1.65;color:var(--text);background:var(--soft);font-size:1.0625rem}
+:focus-visible{outline:3px solid var(--focus);outline-offset:3px;box-shadow:0 0 0 6px var(--primary-dark)}
+h1[tabindex="-1"]:focus,h2[tabindex="-1"]:focus,h3[tabindex="-1"]:focus,main:focus{outline:none;box-shadow:none}
+a{color:var(--primary)}
+.skip-link{position:absolute;left:-9999px;top:0;background:var(--primary-dark);color:#fff;padding:.8rem 1.2rem;z-index:1000;font-weight:700}
+.skip-link:focus{left:0}
+.visually-hidden{position:absolute!important;width:1px;height:1px;overflow:hidden;clip:rect(0 0 0 0);white-space:nowrap}
+
+header{background:var(--primary-dark);color:#fff;position:sticky;top:0;z-index:50;box-shadow:0 2px 10px rgba(0,0,0,.2)}
+header nav{max-width:1300px;margin:0 auto;display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:.5rem;padding:.8rem 1.2rem}
+.logo{font-size:1.3rem;font-weight:800;color:#fff;text-decoration:none}
+.nav-links{display:flex;gap:.4rem;list-style:none;flex-wrap:wrap;align-items:center}
+.nav-links a{color:#fff;text-decoration:none;padding:.6rem .9rem;border-radius:6px;display:inline-block;min-height:44px}
+.nav-links a:hover,.nav-links a[aria-current=page]{background:rgba(255,255,255,.2);text-decoration:underline}
+.nav-email{font-size:.9rem;overflow-wrap:anywhere}
+.nav-out{color:#c7d2fe!important;min-height:44px;padding:.5rem .6rem!important}
+
+.wrap{max-width:820px;margin:0 auto;padding:2rem 1.2rem 3rem}
+.wrap.wide{max-width:1300px}
+h1{font-size:clamp(1.8rem,5vw,2.4rem);line-height:1.2;color:var(--primary-dark);margin-bottom:.8rem}
+h2{font-size:1.4rem;color:var(--primary);margin-bottom:.8rem}
+h3{font-size:1.1rem;color:var(--primary-dark);margin:1rem 0 .4rem}
+.lead{font-size:1.1rem;margin-bottom:1.2rem}
+.panel{background:#fff;border-radius:14px;padding:1.5rem;margin-bottom:1.2rem;box-shadow:0 3px 12px rgba(0,0,0,.07)}
+.panel.narrow{max-width:460px;margin:1rem auto}
+.alert-banner{background:#fff7e6;border-left:6px solid var(--accent);padding:1rem 1.2rem;border-radius:8px;margin-bottom:1.2rem;color:#78350f}
+.error-summary{background:#fee2e2;border:3px solid var(--error);color:#7f1d1d;border-radius:10px;padding:1rem 1.2rem;margin-bottom:1.2rem}
+.error-summary h2{color:#7f1d1d;font-size:1.15rem}
+.error-summary ul{padding-left:1.2rem}
+.error-summary a{color:#7f1d1d;font-weight:700}
+
+.btn{display:inline-block;min-height:48px;padding:.8rem 1.8rem;border-radius:50px;font-weight:700;font-size:1.05rem;text-decoration:none;border:2px solid transparent;cursor:pointer;font-family:inherit}
+.btn-sm{min-height:44px;padding:.45rem 1.1rem;font-size:.95rem}
+.btn-primary{background:var(--primary);color:#fff}
+.btn-primary:hover{background:var(--primary-dark)}
+.btn:disabled{opacity:.6;cursor:wait}
+.btn-outline{background:#fff;color:var(--primary);border-color:var(--primary)}
+.btn-outline:hover{background:var(--soft)}
+.linklike{background:none;border:0;font:inherit;color:var(--primary);text-decoration:underline;cursor:pointer;padding:.2rem .1rem}
+
+.field{margin-bottom:1.1rem}
+label,legend{display:block;font-weight:700;margin-bottom:.3rem}
+label.req::after,legend.req::after{content:" *";content:" *" / "";color:var(--error)}
+.hint{display:block;font-size:.92rem;color:var(--muted);font-weight:400}
+input[type=text],input[type=email],input[type=tel],input[type=number],input[type=date],input[type=password],input[type=search],input[type=file],select,textarea{width:100%;padding:.75rem;font-size:1rem;border:2px solid #6b7280;border-radius:8px;font-family:inherit;background:#fff;color:var(--text)}
+textarea{min-height:96px;resize:vertical}
+[aria-invalid=true]{border-color:var(--error)!important}
+.error-msg{color:var(--error);font-size:.92rem;font-weight:600;margin-top:.3rem}
+fieldset{border:2px solid var(--line);border-radius:10px;padding:.9rem 1rem;margin-bottom:1.1rem}
+.check{display:flex;gap:.6rem;align-items:flex-start;margin-bottom:.5rem}
+.check input{width:24px;height:24px;margin-top:.2rem;flex-shrink:0}
+.check label{font-weight:400;margin:0}
+.grid2{display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:0 1rem}
+.row{display:flex;gap:.6rem;flex-wrap:wrap;align-items:center}
+.row input{flex:1;min-width:160px}
+.status{padding:.8rem 1rem;border-radius:8px;margin-top:1rem;font-weight:600}
+.status.ok{background:#dcfce7;color:var(--ok);border:2px solid var(--ok)}
+.status.err{background:#fee2e2;color:var(--error);border:2px solid var(--error)}
+.status:empty{display:none}
+.small-note{font-size:.92rem;color:var(--muted);margin-top:.9rem}
+.pet{border:2px solid var(--line);border-radius:12px;padding:1rem;margin-bottom:1rem}
+.pet-head{display:flex;justify-content:space-between;align-items:center;margin-bottom:.5rem}
+.pet-head h3{margin:0}
+mark.todo{background:#fde68a;color:#78350f;padding:0 .3rem;border-radius:3px;font-weight:600}
+
+/* Account panel and applicant portal */
+.tabs{display:flex;gap:.5rem;margin-bottom:1rem;flex-wrap:wrap}
+.tabs .btn[aria-pressed=true]{background:var(--primary);color:#fff}
+.case-number{font-size:1.6rem;font-weight:800;color:var(--primary-dark);letter-spacing:.02em;overflow-wrap:anywhere}
+.status-box{background:var(--soft);border-left:6px solid var(--primary);border-radius:8px;padding:.8rem 1rem;margin:.8rem 0}
+.steps{list-style:none;display:flex;flex-wrap:wrap;gap:.4rem;margin:.8rem 0}
+.steps li{padding:.2rem .7rem;border-radius:999px;border:2px solid var(--line);font-size:.85rem;color:var(--muted)}
+.steps li.done{background:#dcfce7;border-color:var(--ok);color:var(--ok)}
+.steps li.current{background:var(--primary);border-color:var(--primary);color:#fff;font-weight:700}
+.reqs{list-style:none}
+.req-item{border:2px solid var(--line);border-radius:10px;padding:.8rem;margin-bottom:.8rem}
+.req-item .row{justify-content:space-between}
+.files{list-style:none;font-size:.92rem;margin:.4rem 0}
+.files li{margin-bottom:.4rem}
+.upload-form{margin-top:.6rem}
+
+/* Staff pipeline */
+.toolbar{display:flex;gap:.6rem;flex-wrap:wrap;align-items:center;justify-content:flex-end;margin-bottom:.8rem}
+.stats{list-style:none;display:grid;grid-template-columns:repeat(auto-fit,minmax(140px,1fr));gap:.8rem;margin:1rem 0}
+.stat{background:#fff;border:1px solid var(--line);border-radius:10px;padding:.7rem;text-align:center}
+.stat-n{font-size:1.8rem;font-weight:800;color:var(--primary)}
+.filters{display:flex;gap:1rem;flex-wrap:wrap;align-items:flex-end;background:#fff;border:1px solid var(--line);border-radius:12px;padding:1rem;margin-bottom:1rem}
+.filters .field{margin:0;flex:1;min-width:170px}
+.board{display:grid;grid-auto-flow:column;grid-auto-columns:minmax(270px,1fr);gap:1rem;overflow-x:auto;padding-bottom:1rem}
+.col{background:#fff;border:1px solid var(--line);border-radius:12px;padding:1rem;min-width:270px}
+.col h3{margin:0;display:flex;justify-content:space-between;align-items:center;color:var(--primary)}
+.count{background:var(--primary);color:#fff;border-radius:999px;padding:0 .65rem;font-size:.85rem}
+.col-help{font-size:.85rem;color:var(--muted);margin:.2rem 0 .8rem}
+.cards-list{list-style:none;display:grid;gap:.6rem}
+.empty{color:var(--muted);font-size:.9rem}
+.case-card{width:100%;text-align:left;background:#fff;border:2px solid var(--line);border-left-width:6px;border-radius:10px;padding:.7rem .8rem;display:grid;gap:.25rem;cursor:pointer;font:inherit;color:inherit}
+.case-card:hover{border-color:var(--primary)}
+.pr-urgent{border-left-color:#991b1b}.pr-high{border-left-color:#c2410c}.pr-normal{border-left-color:#6b7280}
+.card-top{display:flex;justify-content:space-between;gap:.5rem;align-items:center}
+.meta{font-size:.88rem;color:var(--muted)}
+.overdue{color:var(--error);font-weight:700}
+.chips{display:flex;flex-wrap:wrap;gap:.3rem}
+.chip{background:var(--soft);border:1px solid var(--line);border-radius:999px;padding:0 .6rem;font-size:.8rem;color:var(--text)}
+.badge{display:inline-block;padding:0 .55rem;border-radius:999px;font-weight:700;font-size:.78rem}
+.b-urgent{background:#fee2e2;color:#991b1b;border:1px solid #991b1b}
+.b-high{background:#ffedd5;color:#9a3412;border:1px solid #9a3412}
+.b-info{background:#dbeafe;color:#1e3a8a;border:1px solid #1e3a8a}
+.b-ok{background:#dcfce7;color:var(--ok);border:1px solid var(--ok)}
+.case-grid{display:grid;grid-template-columns:1.2fr 1fr;gap:1.5rem}
+.kv>div{display:grid;grid-template-columns:150px 1fr;gap:.5rem;padding:.2rem 0;border-bottom:1px solid #eef0f4}
+.kv dt{font-weight:700;color:var(--muted);font-size:.92rem}
+.pre{white-space:pre-wrap;overflow-wrap:anywhere}
+.petcard{background:var(--soft);border-radius:8px;padding:.6rem .8rem;margin-bottom:.5rem}
+.log{list-style:none;margin-top:1rem}
+.log li{border-left:4px solid var(--primary);background:var(--soft);padding:.5rem .8rem;margin-bottom:.6rem;border-radius:0 8px 8px 0}
+.log-h{font-size:.88rem;color:var(--muted)}
+
+dialog{border:none;border-radius:14px;padding:0;max-width:640px;width:calc(100% - 2rem);box-shadow:0 20px 60px rgba(0,0,0,.4);margin:auto}
+dialog.wide{max-width:1050px}
+dialog::backdrop{background:rgba(17,24,39,.75)}
+.dlg-body{padding:1.5rem;max-height:90vh;overflow-y:auto}
+.dlg-head{display:flex;justify-content:space-between;align-items:flex-start;gap:1rem;margin-bottom:.8rem}
+.dlg-head h2{margin:0}
+.close-btn{background:none;border:2px solid var(--muted);border-radius:8px;width:44px;height:44px;font-size:1.4rem;cursor:pointer;color:var(--text);flex-shrink:0}
+.legal-text p,.legal-text li{margin-bottom:.6rem}
+.legal-text ul{padding-left:1.3rem}
+
+footer{background:#1f2937;color:#fff;text-align:center;padding:2rem 1.2rem}
+footer p{margin-bottom:.4rem}
+footer .linklike,footer a{color:#c7d2fe}
+footer .linklike{padding:.6rem .7rem;min-height:44px}
+
+@media (max-width:800px){.board{display:block}.col{margin-bottom:1rem}.case-grid{grid-template-columns:1fr}.kv>div{grid-template-columns:1fr}}
+@media (prefers-reduced-motion:reduce){*{animation:none!important;transition:none!important;scroll-behavior:auto!important}}
+@media (forced-colors:active){.btn,.panel,.case-card{border:2px solid ButtonText}}
+</style>
+</head>
+
+<body>
+<a href="#main" class="skip-link">Skip to main content</a>
+<noscript><div class="alert-banner">This page needs JavaScript. To reach us without it, email <a href="mailto:info@ayrahsfoundation.org">info@ayrahsfoundation.org</a>.</div></noscript>
+
+<header>
+  <nav aria-label="Main">
+    <a href="#apply" class="logo"><span aria-hidden="true">🐾</span> Ayrah's Foundation</a>
+    <ul class="nav-links">
+      <li><a href="#apply" id="nav-apply">Apply for help</a></li>
+      <li><a href="#portal" id="nav-portal">My case</a></li>
+      <li><a href="#staff" id="nav-staff">Staff</a></li>
+      <li id="nav-user" hidden><span id="nav-email" class="nav-email"></span> <button type="button" class="linklike nav-out" id="btn-signout">Sign out</button></li>
+    </ul>
+  </nav>
+</header>
+
+<main id="main" tabindex="-1">
+
+<!-- ============ APPLY ============ -->
+<section id="apply" class="wrap" aria-labelledby="apply-title">
+  <h1 id="apply-title" tabindex="-1">Apply for Help</h1>
+  <div id="intro">
+    <p class="lead">Ayrah's Foundation helps people experiencing homelessness stay together with their pets. Tell us what's going on and what you need. This takes about 5 to 10 minutes. You can skip anything you're not comfortable answering, except the questions marked with a star.</p>
+    <div class="alert-banner" role="note"><strong>In an emergency, call 911.</strong> For housing and support referrals, dial <strong>211</strong>. For crisis support, call or text <strong>988</strong>. This form is not monitored around the clock. No email? Contact us and we'll help you apply another way.</div>
+  </div>
+  <div class="auth-slot" hidden></div>
+
+  <div id="apply-body">
+    <div id="error-summary" class="error-summary" role="alert" tabindex="-1" hidden></div>
+
+    <form id="apply-form" novalidate>
+      <section class="panel" aria-labelledby="s1">
+        <h2 id="s1">1. About you</h2>
+        <div class="field"><label for="full_name" class="req">Your name</label><input id="full_name" type="text" autocomplete="name" maxlength="200" required aria-describedby="full_name-err"><div class="error-msg" id="full_name-err"></div></div>
+        <div class="field"><label for="preferred_name">What should we call you? <span class="hint">Optional</span></label><input id="preferred_name" type="text" maxlength="200" autocomplete="nickname"></div>
+        <div class="field"><label for="language">Preferred language</label>
+          <select id="language"><option value="English">English</option><option value="Spanish" lang="es">Español (Spanish)</option><option value="Other">Other</option></select></div>
+
+        <fieldset aria-describedby="contact_method-err">
+          <legend class="req">Best way to reach you <span class="visually-hidden">(required)</span></legend>
+          <div class="check"><input type="radio" name="contact_method" id="meth-call" value="Phone call"><label for="meth-call">Phone call</label></div>
+          <div class="check"><input type="radio" name="contact_method" id="meth-text" value="Text message"><label for="meth-text">Text message</label></div>
+          <div class="check"><input type="radio" name="contact_method" id="meth-email" value="Email"><label for="meth-email">Email</label></div>
+          <div class="check"><input type="radio" name="contact_method" id="meth-other" value="Through someone else"><label for="meth-other">Through a friend, family member, or case worker</label></div>
+          <div class="check"><input type="radio" name="contact_method" id="meth-person" value="Find me in person"><label for="meth-person">Find me in person</label></div>
+          <div class="error-msg" id="contact_method-err"></div>
+        </fieldset>
+        <div class="grid2">
+          <div class="field"><label for="phone">Phone number</label><input id="phone" type="tel" autocomplete="tel" maxlength="40" aria-describedby="phone-err"><div class="error-msg" id="phone-err"></div></div>
+          <div class="field"><label for="email">Email address</label><input id="email" type="email" autocomplete="email" maxlength="254" aria-describedby="email-err"><div class="error-msg" id="email-err"></div></div>
+        </div>
+        <div class="field"><label for="contact_notes">Contact notes <span class="hint">Best times to reach you, whether we can leave a voicemail, or who or where to find you</span></label><textarea id="contact_notes" maxlength="1000" aria-describedby="contact_notes-err"></textarea><div class="error-msg" id="contact_notes-err"></div></div>
+      </section>
+
+      <section class="panel" aria-labelledby="s2">
+        <h2 id="s2">2. Your situation</h2>
+        <div class="field"><label for="area" class="req">Where are you staying or spending most of your time?</label><input id="area" type="text" maxlength="300" required aria-describedby="area-hint area-err"><span class="hint" id="area-hint">A city, ZIP code, or nearby cross streets is fine. We don't need an exact address.</span><div class="error-msg" id="area-err"></div></div>
+        <div class="field"><label for="sleeping_location" class="req">Where are you sleeping right now?</label>
+          <select id="sleeping_location" required aria-describedby="sleeping_location-err">
+            <option value="">Select…</option>
+            <option value="Outside">Outside (street, park, etc.)</option>
+            <option value="Vehicle">In a vehicle</option>
+            <option value="Tent or encampment">Tent or encampment</option>
+            <option value="Shelter">In a shelter</option>
+            <option value="Motel or hotel">Motel or hotel</option>
+            <option value="With friends or family">With friends or family</option>
+            <option value="About to lose housing">About to lose my housing</option>
+            <option value="Other">Other</option>
+          </select><div class="error-msg" id="sleeping_location-err"></div></div>
+        <div class="field"><label for="homeless_duration">How long without stable housing? <span class="hint">Optional</span></label>
+          <select id="homeless_duration"><option value="">Select…</option><option>Less than 1 month</option><option>1 to 6 months</option><option>6 to 12 months</option><option>More than 1 year</option><option>Prefer not to say</option></select></div>
+        <div class="grid2">
+          <div class="field"><label for="household_adults">Adults in your household, including you</label><input id="household_adults" type="number" inputmode="numeric" min="0" max="30"></div>
+          <div class="field"><label for="household_children">Children under 18 with you</label><input id="household_children" type="number" inputmode="numeric" min="0" max="30"></div>
+        </div>
+        <div class="check"><input type="checkbox" id="unsafe_now" aria-controls="unsafe-alert"><label for="unsafe_now">Someone (me or my pet) is in danger or needs urgent medical care right now.</label></div>
+        <div id="unsafe-alert" class="alert-banner" role="alert" hidden><strong>Please call 911 now.</strong> We'll mark your application urgent, but this form is not monitored around the clock.</div>
+      </section>
+
+      <section class="panel" aria-labelledby="s3">
+        <h2 id="s3">3. Your pet or pets</h2>
+        <p class="small-note" style="margin:0 0 1rem">Tell us about each animal you have with you. If you don't have a pet, you can skip this section and still apply.</p>
+        <div id="pets"></div>
+        <button type="button" class="btn btn-outline btn-sm" id="add-pet">Add another pet</button>
+        <p class="visually-hidden" id="pet-live" role="status" aria-live="polite"></p>
+      </section>
+
+      <section class="panel" aria-labelledby="s4">
+        <h2 id="s4">4. What help do you need?</h2>
+        <fieldset aria-describedby="needs-err">
+          <legend class="req">Choose everything that applies <span class="visually-hidden">(at least one required)</span></legend>
+          <div class="check"><input type="checkbox" name="needs" id="need-food" value="Food for me"><label for="need-food">Food for me</label></div>
+          <div class="check"><input type="checkbox" name="needs" id="need-petfood" value="Food for my pet"><label for="need-petfood">Food for my pet</label></div>
+          <div class="check"><input type="checkbox" name="needs" id="need-supplies" value="Pet supplies"><label for="need-supplies">Pet supplies (leash, crate, bedding, etc.)</label></div>
+          <div class="check"><input type="checkbox" name="needs" id="need-shelter" value="Shelter"><label for="need-shelter">A place to stay (shelter)</label></div>
+          <div class="check"><input type="checkbox" name="needs" id="need-housing" value="Housing help"><label for="need-housing">Help finding permanent housing</label></div>
+          <div class="check"><input type="checkbox" name="needs" id="need-vet" value="Vet care"><label for="need-vet">Veterinary care</label></div>
+          <div class="check"><input type="checkbox" name="needs" id="need-transport" value="Transportation"><label for="need-transport">Transportation</label></div>
+          <div class="check"><input type="checkbox" name="needs" id="need-docs" value="ID and documents"><label for="need-docs">ID and documents</label></div>
+          <div class="check"><input type="checkbox" name="needs" id="need-other" value="Something else"><label for="need-other">Something else</label></div>
+          <div class="error-msg" id="needs-err"></div>
+        </fieldset>
+        <div class="field"><label for="needs_detail">Tell us more <span class="hint">Optional. What's going on, and what would help most?</span></label><textarea id="needs_detail" maxlength="3000"></textarea></div>
+        <div class="field"><label for="accommodations">Do you need any accommodations to receive help? <span class="hint">Optional. For example mobility, hearing, vision, or language support. Please don't include medical records or diagnoses.</span></label><textarea id="accommodations" maxlength="1500"></textarea></div>
+      </section>
+
+      <section class="panel" aria-labelledby="s5">
+        <h2 id="s5">5. Review and submit</h2>
+        <div class="check"><input type="checkbox" id="consent" required aria-describedby="consent-err"><label for="consent" class="req">I confirm this information is true to the best of my knowledge. I agree that Ayrah's Foundation may contact me about this request and may share only what's needed with partners, such as shelters, housing providers, or veterinarians, to arrange help.</label></div>
+        <div class="error-msg" id="consent-err"></div>
+        <p class="small-note">Please don't type Social Security numbers, ID numbers, immigration status, bank details, or medical records into this form. If our team needs a document, they'll ask you to upload it under My case. Read our <button type="button" class="linklike" data-open="dlg-privacy">Privacy Notice</button>.</p>
+        <p style="margin-top:1rem"><button type="submit" class="btn btn-primary" id="submit-btn">Submit application</button></p>
+        <p class="small-note">Submitting this form does not guarantee help or a response time. If we can't help directly, we'll do our best to point you to other resources.</p>
+        <div class="status" id="submit-status" role="status" aria-live="polite"></div>
+      </section>
+    </form>
+
+    <div id="confirm" class="panel" hidden>
+      <h2 id="confirm-title" tabindex="-1">Thank you. We received your application.</h2>
+      <p>Your case number is:</p>
+      <p class="case-number" id="case-no"></p>
+      <p style="margin-top:.6rem">Write it down or take a screenshot. You can give it to us if you contact us. You can also sign in any time under <a href="#portal">My case</a> to check your status and upload documents we ask for.</p>
+      <h3>What happens next</h3>
+      <p>A member of our team will reach out using the contact method you chose, as soon as we can. If things change or become urgent, <strong>call 911</strong> for emergencies, dial <strong>211</strong> for housing and support referrals, or call or text <strong>988</strong> for crisis support.</p>
+      <p class="row" style="margin-top:1rem"><a class="btn btn-primary" href="#portal">Go to My case</a><button type="button" class="btn btn-outline" id="another">Submit another application</button></p>
+    </div>
+  </div>
+</section>
+
+<!-- ============ MY CASE (applicant portal) ============ -->
+<section id="portal" class="wrap" aria-labelledby="portal-title" hidden>
+  <h1 id="portal-title" tabindex="-1">My Case</h1>
+  <div class="auth-slot" hidden></div>
+  <div id="portal-content" hidden>
+    <p class="lead">Check your status, read updates from our team, and upload documents we ask for. <strong>In an emergency, call 911.</strong></p>
+    <p class="visually-hidden" id="portal-live" role="status" aria-live="polite"></p>
+    <div id="portal-cases"></div>
+    <div id="portal-empty" class="panel" hidden><h2>No application yet</h2><p>You haven't submitted an application with this account.</p><p style="margin-top:1rem"><a class="btn btn-primary" href="#apply">Start your application</a></p></div>
+  </div>
+</section>
+
+<!-- ============ STAFF PIPELINE ============ -->
+<section id="staff" class="wrap wide" aria-labelledby="staff-title" hidden>
+  <h1 id="staff-title" tabindex="-1">Staff Pipeline</h1>
+  <div id="demo-banner" class="alert-banner" role="note" hidden>
+    <strong>Demo mode.</strong> No database is connected, so this preview keeps data only in this session. Staff view needs no sign-in here, and applicant sign-in accepts any email and password. Once you add your Supabase keys, real accounts are required and only approved staff can see applications.
+    <p style="margin-top:.6rem" class="row"><button type="button" class="btn btn-outline btn-sm" id="btn-seed">Load sample applications</button><button type="button" class="btn btn-outline btn-sm" id="btn-clear">Clear demo data</button></p>
+  </div>
+  <div class="auth-slot" hidden></div>
+  <div id="dash" hidden>
+    <div class="toolbar"><button type="button" class="btn btn-outline btn-sm" id="btn-refresh">Refresh</button></div>
+    <ul class="stats" id="stats" aria-label="Summary"></ul>
+    <div class="filters" role="search">
+      <div class="field"><label for="f-q">Search</label><input id="f-q" type="search" placeholder="Name, case number, or area"></div>
+      <div class="field"><label for="f-pr">Priority</label><select id="f-pr"><option value="">All</option><option value="urgent">Urgent</option><option value="high">High</option><option value="normal">Normal</option></select></div>
+      <div class="field"><label for="f-as">Assigned</label><select id="f-as"><option value="">Everyone</option><option value="me">Assigned to me</option><option value="none">Unassigned</option></select></div>
+      <div class="check" style="margin:0"><input type="checkbox" id="f-closed"><label for="f-closed">Show closed</label></div>
+    </div>
+    <p class="visually-hidden" id="board-status" role="status" aria-live="polite"></p>
+    <div id="board" class="board" role="region" aria-label="Applications by stage" tabindex="0"></div>
+  </div>
+</section>
+</main>
+
+<!-- Shared sign-in panel. The script moves it into whichever page needs it. -->
+<div hidden>
+  <div id="auth-panel" class="panel narrow">
+    <h2 id="auth-title">Sign in</h2>
+    <p id="auth-intro" class="small-note" style="margin:0 0 1rem"></p>
+    <div class="tabs" id="auth-tabs" role="group" aria-label="Account options">
+      <button type="button" class="btn btn-outline btn-sm" id="tab-signin" aria-pressed="true">Sign in</button>
+      <button type="button" class="btn btn-outline btn-sm" id="tab-signup" aria-pressed="false">Create account</button>
+    </div>
+    <form id="auth-form" novalidate>
+      <div class="field"><label for="auth-email">Email</label><input id="auth-email" type="email" autocomplete="username" maxlength="254"></div>
+      <div class="field"><label for="auth-pw">Password</label><input id="auth-pw" type="password" autocomplete="current-password" aria-describedby="pw-hint"><span class="hint" id="pw-hint" hidden>Use at least 8 characters.</span></div>
+      <div class="check"><input type="checkbox" id="auth-show"><label for="auth-show">Show password</label></div>
+      <button type="submit" class="btn btn-primary" id="auth-btn">Sign in</button>
+      <div class="status" id="auth-msg" role="status" aria-live="polite"></div>
+    </form>
+    <p class="small-note" id="auth-demo" hidden>Demo mode: any email and password will work.</p>
+    <p class="small-note">Forgot your password or don't have an email? Contact us at <a href="mailto:info@ayrahsfoundation.org">info@ayrahsfoundation.org</a> and include your case number if you have one. Don't share your password. On a shared computer, always sign out when you're done.</p>
+  </div>
+</div>
+
+<footer>
+  <p><strong>Ayrah's Foundation</strong> · 501(c)(3) Tax-Exempt Nonprofit · EIN 33-2899814</p>
+  <p><mark class="todo">[Mailing address]</mark></p>
+  <p>Email: <a href="mailto:info@ayrahsfoundation.org">info@ayrahsfoundation.org</a></p>
+  <p><button type="button" class="linklike" data-open="dlg-privacy">Privacy Notice</button></p>
+</footer>
+
+<!-- PRIVACY NOTICE (applicants) -->
+<dialog id="dlg-privacy" aria-labelledby="t-priv">
+  <div class="dlg-body">
+    <div class="dlg-head"><h2 id="t-priv">Privacy Notice for Applicants</h2><button type="button" class="close-btn" data-close aria-label="Close privacy notice">×</button></div>
+    <div class="legal-text">
+      <p><em>Effective October 10, 2026. Our full Privacy Policy is on our main website.</em></p>
+      <ul>
+        <li><strong>What we collect.</strong> What you enter in the application: your contact details, general location, situation, pet information, and the help you need. If you create an account, we also store your email address and a password, which is protected by our secure sign-in provider.</li>
+        <li><strong>Documents.</strong> Upload only documents our team asks for. They're stored privately and can be seen only by you and approved staff.</li>
+        <li><strong>Why.</strong> To understand your needs, contact you, and arrange food, supplies, shelter, veterinary care, and housing help.</li>
+        <li><strong>Who sees it.</strong> Approved Ayrah's Foundation staff who sign in to our secure system. We do not sell your information.</li>
+        <li><strong>Who we share it with.</strong> Only what's needed, with partners that help arrange the help you asked for (such as shelters, housing providers, or veterinarians) and with service providers that host our systems. We may also share information if the law requires it or to protect someone's safety.</li>
+        <li><strong>Your account.</strong> Anyone with your password can see your case. Don't share it, and sign out on shared computers.</li>
+        <li><strong>Please don't type</strong> Social Security numbers, ID numbers, immigration status, bank details, or medical records into the application form.</li>
+        <li><strong>How long we keep it.</strong> Only as long as needed to help you and meet our legal and record-keeping duties.</li>
+        <li><strong>Your choices.</strong> Email us to review, correct, or ask us to delete your information or account. We'll honor reasonable requests, except where we must keep records by law.</li>
+      </ul>
+      <p>Contact: <a href="mailto:info@ayrahsfoundation.org">info@ayrahsfoundation.org</a> · <mark class="todo">[Mailing address]</mark></p>
+    </div>
+  </div>
+</dialog>
+
+<!-- CASE DETAIL (staff) -->
+<dialog id="dlg-case" class="wide" aria-labelledby="case-title">
+  <div class="dlg-body">
+    <div class="dlg-head"><div><h2 id="case-title"></h2><p id="case-sub" class="meta"></p></div><button type="button" class="close-btn" data-close aria-label="Close case">×</button></div>
+    <div id="case-body"></div>
+  </div>
+</dialog>
+
+<script>
+/* ================= CONFIG =================
+   Paste your Supabase project URL and publishable key. Until you do, the page runs in
+   demo mode (data stays in this preview only; any email and password work).
+   The publishable key is safe in public code because of the row level security in the
+   SQL above. NEVER paste a secret or service_role key here. */
+const SUPABASE_URL = "";  // e.g. "https://abcdefgh.supabase.co"
+const SUPABASE_KEY = "";  // starts with sb_publishable_ (legacy anon key also works)
+const LIVE = !!(SUPABASE_URL && SUPABASE_KEY);
+
+/* ================= HELPERS ================= */
+const $=(s,r=document)=>r.querySelector(s);
+const $$=(s,r=document)=>Array.from(r.querySelectorAll(s));
+const esc=s=>String(s==null?'':s).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+const uuid=()=>crypto.randomUUID?crypto.randomUUID():'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g,c=>{const r=crypto.getRandomValues(new Uint8Array(1))[0]&15;return(c==='x'?r:(r&3|8)).toString(16)});
+const todayStr=()=>new Date().toLocaleDateString('en-CA');
+const fmt=(iso,t)=>{const d=new Date(iso);return isNaN(d)?'':d.toLocaleString(undefined,t?{dateStyle:'medium',timeStyle:'short'}:{dateStyle:'medium'})};
+const fmtDay=s=>new Date(s+'T00:00:00').toLocaleDateString(undefined,{month:'short',day:'numeric'});
+const ago=iso=>{const n=Math.floor((Date.now()-new Date(iso))/864e5);return n<=0?'today':n===1?'1 day ago':n+' days ago'};
+const newest=(a,b)=>b.created_at.localeCompare(a.created_at), oldest=(a,b)=>a.created_at.localeCompare(b.created_at);
+const emailRe=/^[^\s@]+@[^\s@]+\.[^\s@]{2,}$/;
+const isEmail=x=>!!x&&emailRe.test(x);
+const ext=n=>(String(n).split('.').pop()||'').toLowerCase();
+const sizeTxt=b=>b==null?'':b<1048576?Math.max(1,Math.round(b/1024))+' KB':(b/1048576).toFixed(1)+' MB';
+
+/* ================= CONSTANTS ================= */
+const STAGES=[
+ {k:'new',name:'New',help:'Just received. Needs a first contact.'},
+ {k:'contacting',name:'Contacting',help:'Trying to reach the applicant.'},
+ {k:'screening',name:'Needs Assessment',help:'In touch. Confirming needs and pet details.'},
+ {k:'active',name:'Services Active',help:'Food, supplies, vet care, or shelter being arranged or delivered.'},
+ {k:'housing',name:'Housing Pathway',help:'Working toward permanent housing.'},
+ {k:'followup',name:'Follow-Up',help:'Placed or stable. Checking in.'},
+ {k:'closed',name:'Closed',help:'No further action needed.'}
+];
+const STEPS=['new','contacting','screening','active','housing','followup'];
+const stageName=k=>(STAGES.find(s=>s.k===k)||{name:k}).name;
+const APPLICANT_STATUS={
+ new:['Received',"We've received your application. A team member will contact you soon."],
+ contacting:["We're reaching out","We're trying to reach you using the contact method you chose. Please watch for a call, text, or email."],
+ screening:['Reviewing your needs',"We're getting details about what you and your pet need."],
+ active:['Help in progress',"We're arranging or delivering help such as food, supplies, vet care, or shelter."],
+ housing:['Working on housing',"We're working with you toward permanent housing."],
+ followup:['Checking in',"You've been connected to help. We'll check in to see how things are going."],
+ closed:['Case closed','This case is closed. You can apply again or contact us any time you need help.']
+};
+const REQ_LABEL={requested:'Needed',received:'Received, under review',accepted:'Accepted',needs_new:'Please upload again',cancelled:'Cancelled'};
+const REQ_CLASS={requested:'b-high',received:'b-info',accepted:'b-ok',needs_new:'b-urgent',cancelled:''};
+const MIME={pdf:'application/pdf',jpg:'image/jpeg',jpeg:'image/jpeg',png:'image/png',webp:'image/webp',heic:'image/heic',heif:'image/heif'};
+const PR={urgent:0,high:1,normal:2};
+const KIND={note:'Note',contact_attempt:'Contact attempt',referral:'Referral',service:'Service delivered',update:'Case update'};
+const state={apps:[],review:{},current:null,docs:[],dirty:false};
+const portal={cases:{}};
+let session=null,view='apply',authMode='signin';
+const who=()=>session?session.email:'staff@preview';
+
+/* Mirrors the database trigger (demo mode only) */
+function suggestPriority(a){
+  if(a.unsafe_now) return 'urgent';
+  if((a.needs||[]).includes('Shelter')&&['Outside','Vehicle','Tent or encampment'].includes(a.sleeping_location)) return 'high';
+  return 'normal';
+}
+
+/* ================= DATA LAYER ================= */
+function setSession(j,fallbackEmail){
+  session={access_token:j.access_token,refresh_token:j.refresh_token,user_id:j.user&&j.user.id,email:(j.user&&j.user.email)||(session&&session.email)||fallbackEmail,isStaff:session&&session.isStaff,expires_at:Date.now()+(j.expires_in||3600)*1000};
+}
+async function refreshSession(){
+  const res=await fetch(SUPABASE_URL+'/auth/v1/token?grant_type=refresh_token',{method:'POST',headers:{apikey:SUPABASE_KEY,'Content-Type':'application/json'},body:JSON.stringify({refresh_token:session.refresh_token})});
+  const j=await res.json().catch(()=>({}));
+  if(!res.ok){session=null;const e=new Error('auth');e.auth=true;throw e}
+  setSession(j);
+}
+async function sb(path,opts){
+  opts=opts||{};
+  if(session&&session.refresh_token&&Date.now()>session.expires_at-60000) await refreshSession();
+  const headers=Object.assign({apikey:SUPABASE_KEY,'Content-Type':'application/json'},opts.headers||{});
+  if(session) headers.Authorization='Bearer '+session.access_token;
+  const res=await fetch(SUPABASE_URL+path,Object.assign({},opts,{headers}));
+  if(res.status===401){const e=new Error('auth');e.auth=true;throw e}
+  if(!res.ok){const e=new Error((await res.text())||res.statusText);e.status=res.status;throw e}
+  return (res.headers.get('content-type')||'').includes('json')?res.json():null;
+}
+async function storageApi(method,path,body,contentType){
+  if(session&&session.refresh_token&&Date.now()>session.expires_at-60000) await refreshSession();
+  const headers={apikey:SUPABASE_KEY,Authorization:'Bearer '+session.access_token};
+  if(contentType) headers['Content-Type']=contentType;
+  if(method==='POST') headers['x-upsert']='false';
+  const url=SUPABASE_URL+'/storage/v1/object/'+(method==='GET'?'authenticated/':'')+'case-documents/'+path.split('/').map(encodeURIComponent).join('/');
+  const res=await fetch(url,{method,headers,body});
+  if(res.status===401){const e=new Error('auth');e.auth=true;throw e}
+  if(!res.ok) throw new Error(await res.text());
+  return res;
+}
+async function authCall(path,body){
+  const res=await fetch(SUPABASE_URL+path,{method:'POST',headers:{apikey:SUPABASE_KEY,'Content-Type':'application/json'},body:JSON.stringify(body)});
+  return {ok:res.ok,j:await res.json().catch(()=>({}))};
+}
+async function checkStaff(){
+  try{session.isStaff=!!(await sb('/rest/v1/rpc/is_staff',{method:'POST',body:'{}'}))}catch(e){session.isStaff=false}
+}
+async function signIn(email,pw){
+  if(!LIVE){session={email,user_id:'demo:'+email.toLowerCase(),isStaff:false};return 'ok'}
+  const r=await authCall('/auth/v1/token?grant_type=password',{email,password:pw});
+  if(!r.ok||!r.j.access_token) return 'fail';
+  setSession(r.j,email);await checkStaff();return 'ok';
+}
+async function signUp(email,pw){
+  if(!LIVE) return signIn(email,pw);
+  const r=await authCall('/auth/v1/signup',{email,password:pw});
+  if(!r.ok) return 'fail';
+  if(r.j.access_token){setSession(r.j,email);await checkStaff();return 'ok'}
+  return 'confirm';
+}
+
+/* ----- Demo storage (preview only; one JSON blob) ----- */
+const demo={
+  db:null,
+  async load(){
+    if(this.db) return this.db;
+    try{const r=await window.storage.get('portal-demo',false);if(r) this.db=JSON.parse(r.value)}catch(e){}
+    return this.db=this.db||{apps:[],notes:[],reqs:[],docs:[],seq:1000};
+  },
+  async save(){try{await window.storage.set('portal-demo',JSON.stringify(this.db),false)}catch(e){throw new Error('Preview storage unavailable')}}
+};
+const demoApi={
+  async submit(a){const d=await demo.load(),n=new Date().toISOString();d.seq++;d.apps.push(Object.assign({},a,{applicant_id:session.user_id,case_number:'AYR-'+String(new Date().getFullYear()).slice(2)+'-'+d.seq,stage:'new',priority:suggestPriority(a),assigned_to:null,next_followup:null,closed_reason:null,created_at:n,updated_at:n}));await demo.save()},
+  async caseNumber(id){const a=(await demo.load()).apps.find(x=>x.id===id);return a&&a.case_number},
+  async myCases(){const d=await demo.load();return d.apps.filter(a=>a.applicant_id===session.user_id).sort(newest)},
+  async myUpdates(id){const d=await demo.load();return d.notes.filter(n=>n.application_id===id&&n.visible_to_applicant).sort(newest)},
+  async requests(id){const d=await demo.load();return d.reqs.filter(r=>r.application_id===id).sort(oldest)},
+  async docs(id){const d=await demo.load();return d.docs.filter(x=>x.application_id===id).sort(oldest)},
+  async upload(appId,reqId,file){const d=await demo.load();d.docs.push({id:uuid(),application_id:appId,request_id:reqId,file_name:file.name,size_bytes:file.size,created_at:new Date().toISOString()});const q=d.reqs.find(r=>r.id===reqId);if(q&&(q.status==='requested'||q.status==='needs_new')) q.status='received';await demo.save()},
+  async download(){return new Blob(['Preview mode: uploaded file contents are not stored.'],{type:'text/plain'})},
+  async list(){return(await demo.load()).apps.slice().sort(newest)},
+  async update(id,p){const d=await demo.load(),a=d.apps.find(x=>x.id===id);if(a){Object.assign(a,p,{updated_at:new Date().toISOString()});await demo.save()}},
+  async notes(id){const d=await demo.load();return d.notes.filter(n=>n.application_id===id).sort(newest)},
+  async addNote(n){const d=await demo.load();d.notes.push(Object.assign({id:uuid(),created_at:new Date().toISOString()},n));await demo.save()},
+  async addRequest(r){const d=await demo.load(),t=new Date().toISOString();d.reqs.push(Object.assign({id:uuid(),status:'requested',created_at:t,updated_at:t},r));await demo.save()},
+  async updateRequest(id,p){const d=await demo.load(),r=d.reqs.find(x=>x.id===id);if(r){Object.assign(r,p);await demo.save()}},
+  async reviewCounts(){const d=await demo.load();return d.reqs.filter(r=>r.status==='received').map(r=>({application_id:r.application_id}))},
+  async clear(){demo.db={apps:[],notes:[],reqs:[],docs:[],seq:1000};await demo.save()}
+};
+
+const q=encodeURIComponent;
+const api=LIVE?{
+  submit:a=>sb('/rest/v1/applications',{method:'POST',headers:{Prefer:'return=minimal'},body:JSON.stringify(a)}),
+  caseNumber:async id=>{const r=await sb('/rest/v1/my_cases?select=case_number&id=eq.'+q(id));return r&&r[0]&&r[0].case_number},
+  myCases:()=>sb('/rest/v1/my_cases?select=*&order=created_at.desc'),
+  myUpdates:id=>sb('/rest/v1/my_updates?select=*&application_id=eq.'+q(id)+'&order=created_at.desc'),
+  requests:id=>sb('/rest/v1/document_requests?select=*&application_id=eq.'+q(id)+'&order=created_at.asc'),
+  docs:id=>sb('/rest/v1/application_documents?select=*&application_id=eq.'+q(id)+'&order=created_at.asc'),
+  upload:async(appId,reqId,file)=>{
+    const id=uuid(),ct=file.type||MIME[ext(file.name)];
+    const path=appId+'/'+reqId+'/'+id+'_'+file.name.replace(/[^A-Za-z0-9._-]+/g,'_').slice(-80);
+    await storageApi('POST',path,file,ct);
+    await sb('/rest/v1/application_documents',{method:'POST',headers:{Prefer:'return=minimal'},body:JSON.stringify({id,application_id:appId,request_id:reqId,file_path:path,file_name:file.name.slice(0,200),content_type:ct,size_bytes:file.size})});
+  },
+  download:async d=>(await storageApi('GET',d.file_path)).blob(),
+  list:()=>sb('/rest/v1/applications?select=*&order=created_at.desc&limit=1000'),
+  update:(id,p)=>sb('/rest/v1/applications?id=eq.'+q(id),{method:'PATCH',headers:{Prefer:'return=minimal'},body:JSON.stringify(p)}),
+  notes:id=>sb('/rest/v1/application_notes?application_id=eq.'+q(id)+'&order=created_at.desc'),
+  addNote:n=>sb('/rest/v1/application_notes',{method:'POST',headers:{Prefer:'return=minimal'},body:JSON.stringify(n)}),
+  addRequest:r=>sb('/rest/v1/document_requests',{method:'POST',headers:{Prefer:'return=minimal'},body:JSON.stringify(r)}),
+  updateRequest:(id,p)=>sb('/rest/v1/document_requests?id=eq.'+q(id),{method:'PATCH',headers:{Prefer:'return=minimal'},body:JSON.stringify(p)}),
+  reviewCounts:()=>sb('/rest/v1/document_requests?select=application_id&status=eq.received&limit=1000')
+}:demoApi;
+
+/* ================= DIALOGS ================= */
+$$('[data-open]').forEach(b=>b.addEventListener('click',()=>{const d=document.getElementById(b.dataset.open);d._returnTo=b;d.showModal()}));
+$$('dialog').forEach(d=>{
+  d.addEventListener('click',e=>{if(e.target===d) d.close()});
+  d.addEventListener('close',()=>{if(d._returnTo) d._returnTo.focus()});
+  $('[data-close]',d).addEventListener('click',()=>d.close());
+});
+
+/* ================= ACCOUNT PANEL, ROUTING ================= */
+function setAuthMode(m){
+  authMode=m;
+  $('#tab-signin').setAttribute('aria-pressed',m==='signin');
+  $('#tab-signup').setAttribute('aria-pressed',m==='signup');
+  $('#auth-btn').textContent=m==='signup'?'Create account':'Sign in';
+  $('#auth-pw').setAttribute('autocomplete',m==='signup'?'new-password':'current-password');
+  $('#pw-hint').hidden=m!=='signup';
+}
+function configureAuth(v){
+  const staff=v==='staff';
+  $('#auth-tabs').hidden=staff;
+  $('#auth-title').textContent=staff?'Staff sign-in':v==='apply'?'First, sign in or create an account':'Sign in to see your case';
+  $('#auth-intro').textContent=staff?"For approved Ayrah's Foundation staff only.":v==='apply'?'An account lets you check your case status and upload documents later. It only takes a minute.':'Use the email and password you created when you applied.';
+  $('#auth-demo').hidden=LIVE;
+  setAuthMode(staff||v==='portal'?'signin':'signup');
+  const m=$('#auth-msg');m.className='status';m.textContent='';
+  if(staff&&session&&!session.isStaff){m.className='status err';m.textContent='You are signed in as '+session.email+', but this account does not have staff access. Sign out to use a different account.'}
+}
+function gate(v,need){
+  const ok=need==='staff'?(!LIVE||!!(session&&session.isStaff)):!!session;
+  const slot=$('.auth-slot',$('#'+v));
+  slot.hidden=ok;
+  if(!ok){slot.appendChild($('#auth-panel'));configureAuth(v)}
+  return ok;
+}
+function renderNav(){const li=$('#nav-user');li.hidden=!session;if(session) $('#nav-email').textContent=session.email}
+function route(first){
+  const h=location.hash.slice(1);
+  if(['apply','portal','staff'].includes(h)) view=h;
+  else if(!first) return;   /* e.g. the skip link (#main): keep the current page */
+  ['apply','portal','staff'].forEach(v=>$('#'+v).hidden=v!==view);
+  $$('.nav-links a').forEach(a=>a.removeAttribute('aria-current'));
+  $('#nav-'+view).setAttribute('aria-current','page');
+  document.title=({apply:'Apply for Help',portal:'My Case',staff:'Staff Pipeline'})[view]+" – Ayrah's Foundation";
+  renderNav();
+  if(view==='apply') showApply();
+  else if(view==='portal') showPortal();
+  else showStaff();
+  if(!first) $('#'+view+'-title').focus();
+}
+window.addEventListener('hashchange',()=>route(false));
+function wipeScreens(){
+  if($('#dlg-case').open) $('#dlg-case').close();
+  state.apps=[];state.review={};$('#board').innerHTML='';$('#portal-cases').innerHTML='';
+  form.reset();resetPets();$('#unsafe-alert').hidden=true;$('#confirm').hidden=true;form.hidden=false;$('#intro').hidden=false;
+}
+function authLost(){
+  session=null;wipeScreens();route(false);
+  const m=$('#auth-msg');m.className='status err';m.textContent='Your session ended. Please sign in again.';
+}
+$('#tab-signin').addEventListener('click',()=>setAuthMode('signin'));
+$('#tab-signup').addEventListener('click',()=>setAuthMode('signup'));
+$('#auth-show').addEventListener('change',e=>{$('#auth-pw').type=e.target.checked?'text':'password'});
+$('#auth-form').addEventListener('submit',async e=>{
+  e.preventDefault();
+  const msg=$('#auth-msg'),email=$('#auth-email').value.trim(),pw=$('#auth-pw').value;
+  const err=t=>{msg.className='status err';msg.textContent=t};
+  msg.className='status';msg.textContent='';
+  if(!emailRe.test(email)){err('Enter a valid email address.');$('#auth-email').focus();return}
+  if(authMode==='signup'&&pw.length<8){err('Choose a password with at least 8 characters.');$('#auth-pw').focus();return}
+  if(!pw){err('Enter your password.');$('#auth-pw').focus();return}
+  const btn=$('#auth-btn');btn.disabled=true;
+  try{
+    const r=authMode==='signup'?await signUp(email,pw):await signIn(email,pw);
+    if(r==='ok'){$('#auth-pw').value='';$('#auth-show').checked=false;$('#auth-pw').type='password';route(false)}
+    else if(r==='confirm'){msg.className='status ok';msg.textContent='Account created. Check your email to confirm it, then sign in.'}
+    else err(authMode==='signup'?"We couldn't create that account. If you already have one, try signing in.":'Could not sign in. Check your email and password.');
+  }catch(ex){err('Something went wrong. Please try again.')}
+  finally{btn.disabled=false}
+});
+$('#btn-signout').addEventListener('click',async()=>{
+  try{if(LIVE&&session) await fetch(SUPABASE_URL+'/auth/v1/logout',{method:'POST',headers:{apikey:SUPABASE_KEY,Authorization:'Bearer '+session.access_token}})}catch(e){}
+  session=null;wipeScreens();route(false);
+});
+
+/* ================= APPLY ================= */
+let petSeq=0;
+function petHTML(n){const p='pet'+n;return `
+<div class="pet">
+  <div class="pet-head"><h3 class="pet-title">Pet</h3><button type="button" class="btn btn-outline btn-sm pet-remove">Remove</button></div>
+  <div class="grid2">
+    <div class="field"><label for="${p}-name">Name <span class="hint">Optional</span></label><input id="${p}-name" class="p-name" type="text" maxlength="100" autocomplete="off"></div>
+    <div class="field"><label for="${p}-type">Type</label><select id="${p}-type" class="p-type" aria-describedby="${p}-type-err"><option value="">Select…</option><option>Dog</option><option>Cat</option><option>Other</option></select><div class="error-msg" id="${p}-type-err"></div></div>
+    <div class="field"><label for="${p}-size">Size</label><select id="${p}-size" class="p-size"><option value="">Select…</option><option>Small (under 25 lb)</option><option>Medium (25 to 60 lb)</option><option>Large (over 60 lb)</option></select></div>
+    <div class="field"><label for="${p}-age">Approximate age <span class="hint">Example: 3 years</span></label><input id="${p}-age" class="p-age" type="text" maxlength="40" autocomplete="off"></div>
+    <div class="field"><label for="${p}-vax">Vaccinated?</label><select id="${p}-vax" class="p-vax"><option value="">Select…</option><option>Yes</option><option>No</option><option>Not sure</option></select></div>
+    <div class="field"><label for="${p}-fixed">Spayed or neutered?</label><select id="${p}-fixed" class="p-fixed"><option value="">Select…</option><option>Yes</option><option>No</option><option>Not sure</option></select></div>
+  </div>
+  <div class="field"><label for="${p}-notes">Anything we should know? <span class="hint">Optional. Health needs, behavior, or a service animal.</span></label><textarea id="${p}-notes" class="p-notes" maxlength="500"></textarea></div>
+</div>`}
+function renumberPets(){
+  const blocks=$$('.pet');
+  blocks.forEach((b,i)=>{$('.pet-title',b).textContent='Pet '+(i+1);const rm=$('.pet-remove',b);rm.hidden=blocks.length===1;rm.setAttribute('aria-label','Remove pet '+(i+1))});
+  $('#add-pet').hidden=blocks.length>=5;
+}
+function addPet(focus){
+  if($$('.pet').length>=5) return;
+  petSeq++;$('#pets').insertAdjacentHTML('beforeend',petHTML(petSeq));renumberPets();
+  if(focus){$('#pet'+petSeq+'-name').focus();$('#pet-live').textContent='Pet '+$$('.pet').length+' added.'}
+}
+function resetPets(){$('#pets').innerHTML='';petSeq=0;addPet(false)}
+$('#add-pet').addEventListener('click',()=>addPet(true));
+$('#pets').addEventListener('click',e=>{
+  const rm=e.target.closest('.pet-remove');if(!rm) return;
+  rm.closest('.pet').remove();renumberPets();$('#pet-live').textContent='Pet removed.';$('#add-pet').focus();
+});
+$('#unsafe_now').addEventListener('change',e=>{$('#unsafe-alert').hidden=!e.target.checked});
+function readPets(){
+  return $$('.pet').map(b=>({name:$('.p-name',b).value.trim(),type:$('.p-type',b).value,size:$('.p-size',b).value,age:$('.p-age',b).value.trim(),vaccinated:$('.p-vax',b).value,fixed:$('.p-fixed',b).value,notes:$('.p-notes',b).value.trim()})).filter(p=>Object.values(p).some(Boolean));
+}
+function clearErrors(){
+  $$('#apply-form .error-msg').forEach(e=>e.textContent='');
+  $$('#apply-form [aria-invalid]').forEach(e=>e.removeAttribute('aria-invalid'));
+  $('#error-summary').hidden=true;$('#error-summary').innerHTML='';
+}
+function validateApplication(){
+  const errs=[];
+  const fail=(el,msg,errId)=>{
+    const out=document.getElementById(errId||(el.id+'-err'));if(out) out.textContent=msg;
+    if(/^(INPUT|SELECT|TEXTAREA)$/.test(el.tagName)&&el.type!=='radio') el.setAttribute('aria-invalid','true');
+    errs.push({el,msg});
+  };
+  const val=id=>$('#'+id).value.trim();
+  if(!val('full_name')) fail($('#full_name'),'Enter your name.');
+  const m=($('input[name=contact_method]:checked')||{}).value;
+  if(!m) fail($('#meth-call'),'Choose the best way to reach you.','contact_method-err');
+  const phone=val('phone'),email=val('email');
+  if(phone&&phone.replace(/\D/g,'').length<7) fail($('#phone'),'Enter a valid phone number.');
+  else if((m==='Phone call'||m==='Text message')&&!phone) fail($('#phone'),'Enter a phone number so we can reach you.');
+  if(email&&!emailRe.test(email)) fail($('#email'),'Enter a valid email, like name@example.com.');
+  else if(m==='Email'&&!email) fail($('#email'),'Enter your email address.');
+  if((m==='Through someone else'||m==='Find me in person')&&!val('contact_notes')) fail($('#contact_notes'),'Tell us how or where we can reach you.');
+  if(!val('area')) fail($('#area'),'Tell us the general area where you are.');
+  if(!$('#sleeping_location').value) fail($('#sleeping_location'),'Choose where you are sleeping right now.');
+  $$('.pet').forEach((b,i)=>{
+    const any=['.p-name','.p-type','.p-size','.p-age','.p-vax','.p-fixed','.p-notes'].some(s=>$(s,b).value.trim());
+    if(any&&!$('.p-type',b).value) fail($('.p-type',b),'Choose a type for pet '+(i+1)+'.');
+  });
+  if(!$$('input[name=needs]:checked').length) fail($('#need-food'),'Choose at least one kind of help.','needs-err');
+  if(!$('#consent').checked) fail($('#consent'),'Please check the confirmation box to submit.');
+  return errs;
+}
+function showSummary(errs){
+  const box=$('#error-summary');
+  box.innerHTML='<h2>Please fix '+errs.length+(errs.length>1?' items':' item')+' before submitting</h2><ul>'+errs.map((e,i)=>'<li><a href="#" data-i="'+i+'">'+esc(e.msg)+'</a></li>').join('')+'</ul>';
+  box.hidden=false;box.focus();
+  box.onclick=ev=>{const a=ev.target.closest('a[data-i]');if(a){ev.preventDefault();errs[+a.dataset.i].el.focus()}};
+}
+function buildApp(){
+  const val=id=>$('#'+id).value.trim()||null;
+  const num=id=>{const x=$('#'+id).value;return x===''?null:Math.max(0,Math.min(30,parseInt(x,10)||0))};
+  return {
+    id:uuid(),
+    full_name:$('#full_name').value.trim(),preferred_name:val('preferred_name'),language:$('#language').value,
+    contact_method:$('input[name=contact_method]:checked').value,phone:val('phone'),email:val('email'),contact_notes:val('contact_notes'),
+    area:$('#area').value.trim(),sleeping_location:$('#sleeping_location').value,homeless_duration:$('#homeless_duration').value||null,
+    household_adults:num('household_adults'),household_children:num('household_children'),
+    unsafe_now:$('#unsafe_now').checked,pets:readPets(),needs:$$('input[name=needs]:checked').map(x=>x.value),
+    needs_detail:val('needs_detail'),accommodations:val('accommodations'),consent:true
+  };
+}
+function showConfirmation(caseNo){
+  form.hidden=true;$('#intro').hidden=true;$('#error-summary').hidden=true;
+  $('#case-no').textContent=caseNo||'Shown on your My case page';$('#confirm').hidden=false;$('#confirm-title').focus();
+}
+function showApply(){
+  const ok=gate('apply','applicant');
+  $('#apply-body').hidden=!ok;
+  if(ok&&!$('#email').value&&session&&session.email) $('#email').value=session.email;
+}
+const form=$('#apply-form');
+form.addEventListener('input',e=>{
+  const t=e.target;
+  if(t.getAttribute&&t.getAttribute('aria-invalid')){t.removeAttribute('aria-invalid');const o=document.getElementById(t.id+'-err');if(o) o.textContent=''}
+});
+form.addEventListener('change',e=>{
+  if(e.target.name==='contact_method') $('#contact_method-err').textContent='';
+  if(e.target.name==='needs') $('#needs-err').textContent='';
+});
+form.addEventListener('submit',async e=>{
+  e.preventDefault();clearErrors();
+  const st=$('#submit-status');st.className='status';st.textContent='';
+  const errs=validateApplication();
+  if(errs.length){showSummary(errs);return}
+  const btn=$('#submit-btn');btn.disabled=true;btn.textContent='Submitting…';
+  const app=buildApp();
+  try{
+    await api.submit(app);
+    let cn=null;try{cn=await api.caseNumber(app.id)}catch(x){}
+    showConfirmation(cn);
+  }catch(err){
+    if(err.auth){authLost();return}
+    console.error(err);
+    st.className='status err';
+    st.textContent="Something went wrong and your application was not saved. Please try again, or email info@ayrahsfoundation.org.";
+  }finally{btn.disabled=false;btn.textContent='Submit application'}
+});
+$('#another').addEventListener('click',()=>{
+  form.reset();resetPets();$('#unsafe-alert').hidden=true;
+  if(session&&session.email) $('#email').value=session.email;
+  $('#confirm').hidden=true;form.hidden=false;$('#intro').hidden=false;$('#apply-title').focus();
+});
+
+/* ================= MY CASE (applicant portal) ================= */
+function reqItem(c,r,docs){
+  const mine=docs.filter(d=>d.request_id===r.id),fid='file-'+r.id;
+  const canUp=['requested','received','needs_new'].includes(r.status);
+  return `<li class="req-item"><div class="row"><strong>${esc(r.title)}</strong><span class="badge ${REQ_CLASS[r.status]||''}">${esc(REQ_LABEL[r.status]||r.status)}</span></div>
+  ${r.instructions?`<p class="pre">${esc(r.instructions)}</p>`:''}${r.due_date?`<p class="meta">Please send by ${esc(fmtDay(r.due_date))}</p>`:''}
+  ${mine.length?`<ul class="files">${mine.map(d=>`<li>${esc(d.file_name)} · sent ${esc(fmt(d.created_at))}</li>`).join('')}</ul>`:''}
+  ${canUp?`<form class="upload-form" data-app="${esc(c.id)}" data-req="${esc(r.id)}" novalidate><label for="${fid}">${mine.length?'Add another file':'Choose a file'} <span class="hint">PDF or photo, up to 10 MB</span></label><input id="${fid}" type="file" accept=".pdf,.jpg,.jpeg,.png,.webp,.heic,.heif"><p style="margin-top:.6rem"><button type="submit" class="btn btn-primary btn-sm">Upload</button></p><div class="status" role="status" aria-live="polite"></div></form>`:''}</li>`;
+}
+function portalHTML(c,ups,reqs,docs){
+  const st=APPLICANT_STATUS[c.stage]||[c.stage,''],idx=STEPS.indexOf(c.stage);
+  const open=reqs.filter(r=>r.status!=='cancelled');
+  const steps=c.stage==='closed'?'':`<ol class="steps" aria-label="Progress">${STEPS.map((s,i)=>`<li class="${i<idx?'done':i===idx?'current':''}"${i===idx?' aria-current="step"':''}>${esc(APPLICANT_STATUS[s][0])}${i<idx?'<span class="visually-hidden"> (done)</span>':''}</li>`).join('')}</ol>`;
+  const updates=ups.length?`<ul class="files">${ups.map(u=>`<li><span class="meta">${esc(fmt(u.created_at,true))}</span><div class="pre">${esc(u.body)}</div></li>`).join('')}</ul>`:"<p>No updates yet. We'll post news here as we work on your case.</p>";
+  const docsHTML=open.length?`<ul class="reqs">${open.map(r=>reqItem(c,r,docs)).join('')}</ul>`:"<p>We haven't asked you for any documents. If we need something, it will show up here.</p>";
+  return `<h2 id="pt-${esc(c.id)}">Case <span class="case-number">${esc(c.case_number)}</span></h2>
+  <p class="meta">${esc(c.preferred_name||c.full_name)} · submitted ${esc(fmt(c.created_at))} · last updated ${esc(fmt(c.updated_at))}</p>
+  <div class="status-box"><strong>Status: ${esc(st[0])}</strong><p>${esc(st[1])}</p></div>
+  ${steps}
+  <h3>Updates from our team</h3>${updates}
+  <h3 id="pdocs-${esc(c.id)}" tabindex="-1">Documents</h3>${docsHTML}
+  <p class="small-note">Questions? Email <a href="mailto:info@ayrahsfoundation.org">info@ayrahsfoundation.org</a> and include your case number. In an emergency, call 911.</p>`;
+}
+async function renderCase(c){
+  const el=document.getElementById('pc-'+c.id);if(!el) return;
+  const [ups,reqs,docs]=await Promise.all([api.myUpdates(c.id),api.requests(c.id),api.docs(c.id)]);
+  el.innerHTML=portalHTML(c,ups,reqs,docs);
+}
+async function loadPortal(){
+  const box=$('#portal-cases');box.innerHTML='<p>Loading…</p>';
+  try{
+    const cases=await api.myCases();
+    $('#portal-empty').hidden=cases.length>0;
+    box.innerHTML=cases.map(c=>`<article class="panel" id="pc-${esc(c.id)}" aria-labelledby="pt-${esc(c.id)}"><p>Loading…</p></article>`).join('');
+    portal.cases={};cases.forEach(c=>portal.cases[c.id]=c);
+    await Promise.all(cases.map(c=>renderCase(c)));
+  }catch(e){
+    if(e.auth){authLost();return}
+    box.innerHTML='<p class="status err">Could not load your case. Check your connection and try again.</p>';
+  }
+}
+function showPortal(){
+  const ok=gate('portal','applicant');
+  $('#portal-content').hidden=!ok;
+  if(ok) loadPortal();
+}
+$('#portal-cases').addEventListener('submit',async e=>{
+  const f=e.target.closest('.upload-form');if(!f) return;
+  e.preventDefault();
+  const st=$('.status',f),inp=$('input[type=file]',f),file=inp.files[0];
+  const err=t=>{st.className='status err';st.textContent=t};
+  st.className='status';st.textContent='';
+  if(!file){err('Choose a file first.');inp.focus();return}
+  if(file.size>10*1024*1024){err('That file is over 10 MB. Try a smaller file or a photo.');return}
+  if(!MIME[ext(file.name)]){err('Please upload a PDF or a photo (JPG, PNG, WEBP, or HEIC).');return}
+  const btn=$('button',f);btn.disabled=true;st.textContent='Uploading…';
+  try{
+    await api.upload(f.dataset.app,f.dataset.req,file);
+    await renderCase(portal.cases[f.dataset.app]);
+    $('#portal-live').textContent='Document uploaded. Thank you.';
+    const h=document.getElementById('pdocs-'+f.dataset.app);if(h) h.focus();
+  }catch(ex){
+    if(ex.auth){authLost();return}
+    console.error(ex);err('The upload failed. Please try again, or contact us.');
+  }finally{btn.disabled=false}
+});
+
+/* ================= STAFF PIPELINE ================= */
+function showStaff(){
+  $('#demo-banner').hidden=LIVE;
+  const ok=gate('staff','staff');
+  $('#dash').hidden=!ok;
+  if(ok) loadApps();
+}
+$('#btn-refresh').addEventListener('click',()=>loadApps());
+document.addEventListener('visibilitychange',()=>{if(!document.hidden&&view==='staff'&&!$('#dash').hidden&&!$('#dlg-case').open) loadApps()});
+
+async function loadApps(){
+  $('#board-status').textContent='Loading applications…';
+  try{
+    const [apps,rev]=await Promise.all([api.list(),api.reviewCounts().catch(()=>[])]);
+    state.apps=apps;state.review={};
+    rev.forEach(r=>state.review[r.application_id]=(state.review[r.application_id]||0)+1);
+    renderBoard();
+    $('#board-status').textContent=apps.length+' applications loaded.';
+  }catch(e){
+    if(e.auth){authLost();return}
+    $('#board-status').textContent='Could not load applications.';
+    $('#board').innerHTML='<p class="status err">Could not load applications. '+esc(e.status===403?'Your account may not have access. Confirm the grants were run and you are in the staff_users table.':'Check your connection and try again.')+'</p>';
+  }
+}
+const badge=p=>p==='urgent'?'<span class="badge b-urgent">Urgent</span>':p==='high'?'<span class="badge b-high">High</span>':'';
+function filtered(){
+  const qq=$('#f-q').value.trim().toLowerCase(),pr=$('#f-pr').value,as=$('#f-as').value,closed=$('#f-closed').checked;
+  return state.apps.filter(a=>{
+    if(!closed&&a.stage==='closed') return false;
+    if(pr&&a.priority!==pr) return false;
+    if(as==='me'&&a.assigned_to!==who()) return false;
+    if(as==='none'&&a.assigned_to) return false;
+    if(qq&&![a.full_name,a.preferred_name,a.area,a.case_number,a.phone,a.email].join(' ').toLowerCase().includes(qq)) return false;
+    return true;
+  });
+}
+function cardHTML(a){
+  const pets=(a.pets||[]).map(p=>p.type).filter(Boolean),needs=a.needs||[],rv=state.review[a.id];
+  const fu=a.next_followup,t=todayStr(),over=fu&&fu<t&&a.stage!=='closed',due=fu&&fu===t;
+  return `<li><button type="button" class="case-card pr-${esc(a.priority)}" data-case="${esc(a.id)}" aria-haspopup="dialog">
+    <span class="card-top"><strong>${esc(a.preferred_name||a.full_name)}</strong>${badge(a.priority)}</span>
+    <span class="meta">${esc(a.case_number)} · applied ${esc(ago(a.created_at))}</span>
+    ${pets.length?`<span class="meta">Pets: ${esc(pets.join(', '))}</span>`:''}
+    <span class="chips">${needs.slice(0,3).map(n=>`<span class="chip">${esc(n)}</span>`).join('')}${needs.length>3?`<span class="chip">+${needs.length-3} more</span>`:''}</span>
+    <span class="meta">${a.assigned_to?'Assigned: '+esc(a.assigned_to):'Unassigned'}</span>
+    ${rv?`<span class="meta overdue">Documents to review: ${rv}</span>`:''}
+    ${fu?`<span class="meta ${over?'overdue':''}">${over?'Follow-up overdue: ':due?'Follow-up today: ':'Follow-up: '}${esc(fmtDay(fu))}</span>`:''}
+  </button></li>`;
+}
+function renderStats(){
+  const open=state.apps.filter(a=>a.stage!=='closed'),t=todayStr();
+  const s=[['New',state.apps.filter(a=>a.stage==='new').length],['Urgent (open)',open.filter(a=>a.priority==='urgent').length],['Follow-ups due',open.filter(a=>a.next_followup&&a.next_followup<=t).length],['Documents to review',Object.values(state.review).reduce((x,y)=>x+y,0)],['Open total',open.length]];
+  $('#stats').innerHTML=s.map(x=>`<li class="stat"><div class="stat-n">${x[1]}</div><div>${x[0]}</div></li>`).join('');
+}
+function renderBoard(){
+  const apps=filtered(),showClosed=$('#f-closed').checked;
+  const hint=state.apps.length?'':'<p class="status err" style="grid-column:1/-1">No applications yet. New submissions will appear here. If you expected some, confirm you are in the staff_users table.</p>';
+  $('#board').innerHTML=hint+STAGES.filter(s=>showClosed||s.k!=='closed').map(s=>{
+    const items=apps.filter(a=>a.stage===s.k).sort((a,b)=>(PR[a.priority]??2)-(PR[b.priority]??2)||a.created_at.localeCompare(b.created_at));
+    return `<section class="col" aria-labelledby="col-${s.k}"><h3 id="col-${s.k}">${s.name} <span class="count">${items.length}</span></h3><p class="col-help">${s.help}</p><ul class="cards-list">${items.map(cardHTML).join('')||'<li class="empty">Nothing here</li>'}</ul></section>`;
+  }).join('');
+  renderStats();
+}
+['#f-q','#f-pr','#f-as','#f-closed'].forEach(s=>$(s).addEventListener('input',renderBoard));
+$('#board').addEventListener('click',e=>{const b=e.target.closest('[data-case]');if(b) openCase(b.dataset.case)});
+
+/* ----- Case detail ----- */
+const kv=(k,v)=>v?`<div><dt>${k}</dt><dd>${v}</dd></div>`:'';
+const pre=s=>s?`<span class="pre">${esc(s)}</span>`:'';
+function petCard(p){
+  const bits=[p.type,p.size,p.age&&('age '+p.age),p.vaccinated&&('vaccinated: '+p.vaccinated),p.fixed&&('spayed/neutered: '+p.fixed)].filter(Boolean).map(esc).join(' · ');
+  return `<div class="petcard"><strong>${esc(p.name||'Unnamed pet')}</strong><br>${bits}${p.notes?`<br><span class="pre">${esc(p.notes)}</span>`:''}</div>`;
+}
+function caseHTML(a){
+  const idx=STAGES.findIndex(s=>s.k===a.stage),next=STAGES[idx+1];
+  const opts=(list,sel)=>list.map(o=>`<option value="${esc(o[0])}"${o[0]===sel?' selected':''}>${esc(o[1])}</option>`).join('');
+  const phoneLink=a.phone?`<a href="tel:${esc(String(a.phone).replace(/[^\d+]/g,''))}">${esc(a.phone)}</a>`:'';
+  const emailLink=isEmail(a.email)?`<a href="mailto:${esc(a.email)}">${esc(a.email)}</a>`:esc(a.email);
+  const hh=(a.household_adults!=null||a.household_children!=null)?esc((a.household_adults==null?'?':a.household_adults)+' adult(s), '+(a.household_children||0)+' child(ren)'):'';
+  return `<div class="case-grid">
+  <div>
+    <h3>Contact</h3><dl class="kv">${kv('Preferred contact',esc(a.contact_method))}${kv('Phone',phoneLink)}${kv('Email',emailLink)}${kv('Contact notes',pre(a.contact_notes))}${kv('Language',esc(a.language))}</dl>
+    <h3>Situation</h3><dl class="kv">${kv('Area',esc(a.area))}${kv('Sleeping',esc(a.sleeping_location))}${kv('Without stable housing',esc(a.homeless_duration))}${kv('Household',hh)}${kv('Immediate danger',a.unsafe_now?'<strong class="overdue">Yes, flagged by applicant</strong>':'No')}</dl>
+    <h3>Pets</h3>${(a.pets||[]).length?a.pets.map(petCard).join(''):'<p>None listed.</p>'}
+    <h3>Needs</h3><p class="chips">${(a.needs||[]).map(n=>`<span class="chip">${esc(n)}</span>`).join('')}</p>${a.needs_detail?`<p class="pre">${esc(a.needs_detail)}</p>`:''}
+    ${a.accommodations?`<h3>Accommodations requested</h3><p class="pre">${esc(a.accommodations)}</p>`:''}
+  </div>
+  <div>
+    <form id="cm-form" novalidate>
+      <h3>Case management</h3>
+      <div class="field"><label for="cm-stage">Stage</label><select id="cm-stage">${opts(STAGES.map(s=>[s.k,s.name]),a.stage)}</select></div>
+      <div class="field" id="cm-closed-wrap" hidden><label for="cm-closed">Reason for closing</label><select id="cm-closed">${opts([['','Select a reason…'],['Housed or stable','Housed or stable'],['Referred elsewhere','Referred elsewhere'],['Unable to reach','Unable to reach'],['Withdrew','Withdrew'],['Not eligible or out of area','Not eligible or out of area'],['Other','Other']],a.closed_reason||'')}</select></div>
+      <div class="field"><label for="cm-priority">Priority <span class="hint">Suggested from the application. Change it if needed.</span></label><select id="cm-priority">${opts([['urgent','Urgent'],['high','High'],['normal','Normal']],a.priority)}</select></div>
+      <div class="field"><label for="cm-assigned">Assigned to</label><div class="row"><input id="cm-assigned" type="text" maxlength="120" value="${esc(a.assigned_to||'')}"><button type="button" class="btn btn-outline btn-sm" id="btn-assign-me">Assign to me</button></div></div>
+      <div class="field"><label for="cm-follow">Next follow-up date</label><input id="cm-follow" type="date" value="${esc(a.next_followup||'')}"></div>
+      <div class="row"><button type="submit" class="btn btn-primary btn-sm">Save changes</button>${a.stage!=='closed'&&next?`<button type="button" class="btn btn-outline btn-sm" id="btn-advance" data-next="${next.k}">${next.k==='closed'?'Close this case…':'Advance to '+esc(next.name)}</button>`:''}</div>
+      <div class="status" id="cm-status" role="status" aria-live="polite"></div>
+    </form>
+
+    <section aria-labelledby="docs-h"><h3 id="docs-h">Documents</h3>
+      <ul class="reqs" id="req-list"><li>Loading…</li></ul>
+      <form id="req-form" novalidate>
+        <div class="field"><label for="req-title">Request a document <span class="hint">Pick one or type your own. Ask only for what you truly need.</span></label><input id="req-title" list="req-options" maxlength="200"><datalist id="req-options"><option value="Photo ID"></option><option value="Proof of pet vaccination"></option><option value="Pet license or microchip record"></option><option value="Proof of income"></option><option value="Housing or lease document"></option></datalist></div>
+        <div class="field"><label for="req-instr">Instructions for the applicant <span class="hint">Optional</span></label><textarea id="req-instr" maxlength="1000"></textarea></div>
+        <div class="field"><label for="req-due">Send by <span class="hint">Optional</span></label><input id="req-due" type="date"></div>
+        <button type="submit" class="btn btn-outline btn-sm">Send request</button>
+        <div class="status" id="req-status" role="status" aria-live="polite"></div>
+      </form>
+    </section>
+
+    <section aria-labelledby="log-h"><h3 id="log-h">Activity log</h3>
+      <form id="note-form" novalidate>
+        <div class="field"><label for="note-kind">Entry type</label><select id="note-kind"><option value="note">Note</option><option value="contact_attempt">Contact attempt</option><option value="referral">Referral</option><option value="service">Service delivered</option></select></div>
+        <div class="field"><label for="note-body">Entry</label><textarea id="note-body" maxlength="5000"></textarea></div>
+        <div class="check"><input type="checkbox" id="note-share"><label for="note-share">Share this entry with the applicant on their My case page <span class="hint">Keep internal details out of shared entries.</span></label></div>
+        <button type="submit" class="btn btn-outline btn-sm">Add to log</button>
+        <div class="status" id="note-status" role="status" aria-live="polite"></div>
+      </form>
+      <ol class="log" id="log"><li>Loading…</li></ol>
+    </section>
+  </div></div>`;
+}
+function caseHeader(a){
+  $('#case-title').textContent=(a.preferred_name||a.full_name)+' · '+a.case_number;
+  $('#case-sub').innerHTML='Applied '+esc(fmt(a.created_at))+' · '+esc(stageName(a.stage))+' '+badge(a.priority)+(a.preferred_name?' · Legal name: '+esc(a.full_name):'');
+}
+function syncClosedField(){$('#cm-closed-wrap').hidden=$('#cm-stage').value!=='closed'}
+async function loadNotes(id){
+  const ol=$('#log');if(!ol) return;
+  try{
+    const n=await api.notes(id);
+    ol.innerHTML=n.length?n.map(x=>`<li><div class="log-h"><strong>${esc(KIND[x.kind]||x.kind)}</strong> · ${esc(fmt(x.created_at,true))}${x.author?' · '+esc(x.author):''}${x.visible_to_applicant?' · <span class="chip">Shared with applicant</span>':''}</div><div class="pre">${esc(x.body)}</div></li>`).join(''):'<li>No entries yet.</li>';
+  }catch(e){if(e.auth){authLost();return}ol.innerHTML='<li>Could not load the log.</li>'}
+}
+async function loadDocs(id){
+  const ul=$('#req-list');if(!ul) return;
+  try{
+    const [reqs,docs]=await Promise.all([api.requests(id),api.docs(id)]);
+    state.docs=docs;
+    ul.innerHTML=reqs.length?reqs.map(r=>`<li class="req-item"><div class="row"><strong>${esc(r.title)}</strong><span class="badge ${REQ_CLASS[r.status]||''}">${esc(REQ_LABEL[r.status]||r.status)}</span></div>
+      ${r.instructions?`<p class="meta pre">${esc(r.instructions)}</p>`:''}${r.due_date?`<p class="meta">Send by ${esc(fmtDay(r.due_date))}</p>`:''}
+      <ul class="files">${docs.filter(d=>d.request_id===r.id).map(d=>`<li>${esc(d.file_name)} · ${esc(sizeTxt(d.size_bytes))} · ${esc(fmt(d.created_at))} <button type="button" class="linklike" data-dl="${esc(d.id)}">Download</button></li>`).join('')||'<li class="meta">No files yet.</li>'}</ul>
+      <label for="rs-${esc(r.id)}" class="visually-hidden">Status for ${esc(r.title)}</label>
+      <select id="rs-${esc(r.id)}" data-reqstatus="${esc(r.id)}" data-title="${esc(r.title)}">${Object.keys(REQ_LABEL).map(k=>`<option value="${k}"${k===r.status?' selected':''}>${esc(REQ_LABEL[k])}</option>`).join('')}</select></li>`).join(''):'<li>No requests yet.</li>';
+  }catch(e){if(e.auth){authLost();return}ul.innerHTML='<li>Could not load documents.</li>'}
+}
+function openCase(id){
+  const a=state.apps.find(x=>x.id===id);if(!a) return;
+  state.current=a;caseHeader(a);
+  $('#case-body').innerHTML=caseHTML(a);syncClosedField();
+  $('#dlg-case').showModal();loadNotes(a.id);loadDocs(a.id);
+}
+$('#dlg-case').addEventListener('close',()=>{
+  const id=state.current&&state.current.id;
+  const b=id&&$('[data-case="'+CSS.escape(id)+'"]');
+  (b||$('#staff-title')).focus();
+  if(state.dirty){state.dirty=false;loadApps()}
+});
+const LABEL={stage:'Stage',priority:'Priority',assigned_to:'Assigned to',next_followup:'Next follow-up',closed_reason:'Closed reason'};
+function describeChanges(a,p){
+  const show=(k,v)=>k==='stage'?stageName(v):(v==null||v===''?'none':v);
+  return Object.keys(p).filter(k=>(a[k]==null?'':a[k])!==(p[k]==null?'':p[k])).map(k=>LABEL[k]+': '+show(k,a[k])+' → '+show(k,p[k]));
+}
+async function saveCase(){
+  const a=state.current,st=$('#cm-status');st.className='status';st.textContent='';
+  const stage=$('#cm-stage').value;
+  const patch={stage,priority:$('#cm-priority').value,assigned_to:$('#cm-assigned').value.trim()||null,next_followup:$('#cm-follow').value||null,closed_reason:stage==='closed'?($('#cm-closed').value||null):null};
+  if(stage==='closed'&&!patch.closed_reason){st.className='status err';st.textContent='Choose a reason for closing this case.';$('#cm-closed').focus();return}
+  const changes=describeChanges(a,patch);
+  if(!changes.length){st.textContent='No changes to save.';return}
+  try{
+    await api.update(a.id,patch);
+    await api.addNote({application_id:a.id,author:who(),kind:'update',body:changes.join('; ')});
+    Object.assign(a,patch,{updated_at:new Date().toISOString()});
+    caseHeader(a);renderBoard();loadNotes(a.id);
+    st.className='status ok';st.textContent='Saved.';
+  }catch(e){
+    if(e.auth){authLost();return}
+    st.className='status err';st.textContent='Could not save. Check your connection and try again.';
+  }
+}
+async function addNote(){
+  const a=state.current,body=$('#note-body').value.trim(),st=$('#note-status');st.className='status';st.textContent='';
+  if(!body){st.className='status err';st.textContent='Write an entry before adding it.';$('#note-body').focus();return}
+  try{
+    await api.addNote({application_id:a.id,author:who(),kind:$('#note-kind').value,body,visible_to_applicant:$('#note-share').checked});
+    $('#note-body').value='';$('#note-share').checked=false;st.className='status ok';st.textContent='Added to the log.';loadNotes(a.id);
+  }catch(e){
+    if(e.auth){authLost();return}
+    st.className='status err';st.textContent='Could not save the entry. Try again.';
+  }
+}
+async function addRequest(){
+  const a=state.current,t=$('#req-title').value.trim(),st=$('#req-status');st.className='status';st.textContent='';
+  if(!t){st.className='status err';st.textContent='Choose or type what you need.';$('#req-title').focus();return}
+  try{
+    await api.addRequest({application_id:a.id,title:t,instructions:$('#req-instr').value.trim()||null,due_date:$('#req-due').value||null});
+    await api.addNote({application_id:a.id,author:who(),kind:'update',body:'Requested document: '+t});
+    $('#req-title').value='';$('#req-instr').value='';$('#req-due').value='';
+    st.className='status ok';st.textContent='Request sent. The applicant will see it under My case.';
+    state.dirty=true;loadDocs(a.id);loadNotes(a.id);
+  }catch(e){
+    if(e.auth){authLost();return}
+    st.className='status err';st.textContent='Could not send the request. Try again.';
+  }
+}
+async function saveBlob(d){
+  const st=$('#req-status');
+  try{
+    const blob=await api.download(d),url=URL.createObjectURL(blob),a=document.createElement('a');
+    a.href=url;a.download=d.file_name;document.body.appendChild(a);a.click();a.remove();setTimeout(()=>URL.revokeObjectURL(url),5000);
+  }catch(e){if(e.auth){authLost();return}st.className='status err';st.textContent='Could not download that file.'}
+}
+const cb=$('#case-body');
+cb.addEventListener('submit',e=>{
+  e.preventDefault();
+  if(e.target.id==='cm-form') saveCase();
+  else if(e.target.id==='note-form') addNote();
+  else if(e.target.id==='req-form') addRequest();
+});
+cb.addEventListener('change',async e=>{
+  if(e.target.id==='cm-stage'){syncClosedField();return}
+  const rid=e.target.dataset&&e.target.dataset.reqstatus;if(!rid) return;
+  const st=$('#req-status');st.className='status';st.textContent='';
+  try{
+    await api.updateRequest(rid,{status:e.target.value,updated_at:new Date().toISOString()});
+    await api.addNote({application_id:state.current.id,author:who(),kind:'update',body:'Document "'+e.target.dataset.title+'" marked: '+REQ_LABEL[e.target.value]});
+    st.className='status ok';st.textContent='Saved.';state.dirty=true;loadDocs(state.current.id);loadNotes(state.current.id);
+  }catch(ex){
+    if(ex.auth){authLost();return}
+    st.className='status err';st.textContent='Could not save the status.';
+  }
+});
+cb.addEventListener('click',e=>{
+  const dl=e.target.closest('[data-dl]');
+  if(dl){const d=state.docs.find(x=>x.id===dl.dataset.dl);if(d) saveBlob(d);return}
+  if(e.target.id==='btn-assign-me') $('#cm-assigned').value=who();
+  if(e.target.id==='btn-advance'){
+    const k=e.target.dataset.next;$('#cm-stage').value=k;syncClosedField();
+    if(k==='closed') $('#cm-closed').focus();else saveCase();
+  }
+});
+
+/* ----- Demo helpers ----- */
+async function seedDemo(){
+  const d=await demo.load();
+  const t=n=>new Date(Date.now()-n*864e5).toISOString(),day=n=>new Date(Date.now()+n*864e5).toLocaleDateString('en-CA');
+  const base={language:'English',consent:true,homeless_duration:null,household_adults:1,household_children:0,accommodations:null,contact_notes:null,email:null,assigned_to:null,next_followup:null,closed_reason:null};
+  const pet=(name,type,size)=>({name,type,size,age:'',vaccinated:'Yes',fixed:'Yes',notes:''});
+  const mk=(o,age)=>{d.seq++;const x=Object.assign({},base,o,{id:uuid(),applicant_id:o.applicant_id||'demo:sample',case_number:'AYR-'+String(new Date().getFullYear()).slice(2)+'-'+d.seq,created_at:t(age),updated_at:t(age)});d.apps.push(x);return x};
+  mk({full_name:'Sample: Maria L.',contact_method:'Text message',phone:'555-0101',area:'Downtown area',sleeping_location:'Vehicle',unsafe_now:true,pets:[pet('Luna','Dog','Medium (25 to 60 lb)')],needs:['Shelter','Food for my pet'],needs_detail:'Sleeping in my car with my dog. We need a safe place tonight.',stage:'new',priority:'urgent'},0);
+  const a2=mk({full_name:'Sample: James R.',contact_method:'Phone call',phone:'555-0102',area:'Near the river trail',sleeping_location:'Tent or encampment',unsafe_now:false,pets:[pet('Miso','Cat','Small (under 25 lb)')],needs:['Shelter','Vet care'],stage:'contacting',priority:'high',assigned_to:'staff@preview',applicant_id:session?session.user_id:'demo:sample'},2);
+  mk({full_name:'Sample: Dana K.',contact_method:'Email',email:'dana@example.org',area:'Eastside',sleeping_location:'With friends or family',unsafe_now:false,pets:[pet('Bear','Dog','Large (over 60 lb)'),pet('Pip','Cat','Small (under 25 lb)')],needs:['Pet supplies','Food for my pet','Transportation','Vet care'],stage:'active',priority:'normal',next_followup:day(-1)},6);
+  mk({full_name:'Sample: Chris T.',contact_method:'Through someone else',contact_notes:'Reach through the case worker at the day center.',area:'Westside',sleeping_location:'Shelter',unsafe_now:false,pets:[pet('Scout','Dog','Medium (25 to 60 lb)')],needs:['Housing help','ID and documents'],stage:'housing',priority:'normal',assigned_to:'staff@preview',next_followup:day(5)},20);
+  d.reqs.push({id:uuid(),application_id:a2.id,title:'Proof of pet vaccination',instructions:'A vet record or a photo of the tag is fine.',due_date:day(3),status:'requested',created_at:t(1),updated_at:t(1)});
+  d.notes.push({id:uuid(),application_id:a2.id,author:'staff@preview',kind:'contact_attempt',body:'Left a voicemail. Will try again tomorrow.',visible_to_applicant:false,created_at:t(2)});
+  d.notes.push({id:uuid(),application_id:a2.id,author:'staff@preview',kind:'note',body:'Thanks for talking with us. We are looking for a pet-friendly bed for you and Miso this week.',visible_to_applicant:true,created_at:t(1)});
+  await demo.save();await loadApps();
+}
+$('#btn-seed').addEventListener('click',seedDemo);
+$('#btn-clear').addEventListener('click',async()=>{await demoApi.clear();await loadApps()});
+
+/* ================= START ================= */
+resetPets();
+route(true);
+</script>
+</body>
+</html>
