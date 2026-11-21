@@ -1,0 +1,1557 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Apply for Help – Ayrah's Foundation</title>
+
+<!--
+================================================================
+AYRAH'S FOUNDATION: APPLICATION FORM, APPLICANT PORTAL + STAFF PIPELINE
+Public application form:    your-file.html
+Applicant "Check my case":  your-file.html#status
+Staff pipeline (sign-in):   your-file.html#staff
+
+SETUP (Supabase, same project as your other forms)
+1. SQL Editor: run Part 1 (only if you created the earlier form tables), then run Part 2.
+   Part 2 is safe on a new project or on top of the earlier version of this page.
+2. Run the LAST statement of Part 2 with YOUR sign-in email (skip if you already added yourself).
+3. Authentication > Users > Add user: create your staff login (tick Auto Confirm User).
+   Then Authentication > Sign In / Providers: turn OFF "Allow new users to sign up".
+4. Paste your Project URL and publishable key into SUPABASE_URL and SUPABASE_KEY near the bottom of this file.
+5. Host the file. Test the whole loop: apply, save the case number and access code, open #status,
+   sign in at #staff, request a document, upload it as the applicant, then review it as staff.
+
+NEVER put a secret or service_role key in this file.
+
+================================================================
+PART 1 (OPTIONAL): GRANTS FOR THE EARLIER FORM TABLES
+Supabase no longer exposes new tables to its Data API automatically, so the
+earlier tables need explicit grants or their forms fail with "permission denied".
+Skip this part if you never created those tables.
+
+grant insert on public.volunteers, public.donation_pledges, public.supply_donations,
+  public.contact_messages, public.help_requests to anon;
+grant usage on sequence public.volunteers_id_seq, public.donation_pledges_id_seq,
+  public.supply_donations_id_seq, public.contact_messages_id_seq,
+  public.help_requests_id_seq to anon;
+
+================================================================
+PART 2: TABLES, FUNCTIONS, SECURITY AND DOCUMENT STORAGE
+
+create extension if not exists pgcrypto with schema extensions;
+create sequence if not exists public.case_number_seq;
+
+create table if not exists public.applications (
+  id uuid primary key default gen_random_uuid(),
+  created_at timestamptz not null default now(),
+  updated_at timestamptz not null default now(),
+  case_number text,
+  access_code_hash text,
+  doc_folder uuid not null default gen_random_uuid(),
+  full_name text not null check (char_length(full_name) between 1 and 200),
+  preferred_name text check (char_length(preferred_name) <= 200),
+  language text check (char_length(language) <= 40),
+  contact_method text not null check (char_length(contact_method) <= 60),
+  phone text check (char_length(phone) <= 40),
+  email text check (char_length(email) <= 254),
+  contact_notes text check (char_length(contact_notes) <= 1000),
+  area text not null check (char_length(area) between 1 and 300),
+  sleeping_location text check (char_length(sleeping_location) <= 80),
+  homeless_duration text check (char_length(homeless_duration) <= 60),
+  household_adults int check (household_adults between 0 and 30),
+  household_children int check (household_children between 0 and 30),
+  unsafe_now boolean not null default false,
+  pets jsonb not null default '[]'::jsonb
+    check (case when jsonb_typeof(pets) = 'array'
+           then jsonb_array_length(pets) <= 10 and pg_column_size(pets) < 20000
+           else false end),
+  needs text[] not null default '{}' check (cardinality(needs) <= 12),
+  needs_detail text check (char_length(needs_detail) <= 3000),
+  accommodations text check (char_length(accommodations) <= 1500),
+  consent boolean not null check (consent = true),
+  stage text not null default 'new'
+    check (stage in ('new','contacting','screening','active','housing','followup','closed')),
+  priority text not null default 'normal' check (priority in ('urgent','high','normal')),
+  assigned_to text,
+  next_followup date,
+  closed_reason text,
+  closed_at timestamptz
+);
+alter table public.applications add column if not exists case_number text;
+alter table public.applications add column if not exists access_code_hash text;
+alter table public.applications add column if not exists doc_folder uuid not null default gen_random_uuid();
+update public.applications
+   set case_number = 'AYR-' || to_char(created_at, 'YY') || '-' || lpad(nextval('public.case_number_seq')::text, 5, '0')
+ where case_number is null;
+create unique index if not exists applications_case_number_key on public.applications (case_number);
+
+create table if not exists public.application_notes (
+  id bigint generated always as identity primary key,
+  application_id uuid not null references public.applications(id) on delete cascade,
+  created_at timestamptz not null default now(),
+  author text,
+  kind text not null default 'note' check (kind in ('note','contact_attempt','referral','service','update')),
+  body text not null check (char_length(body) between 1 and 5000)
+);
+
+create table if not exists public.document_requests (
+  id uuid primary key default gen_random_uuid(),
+  application_id uuid not null references public.applications(id) on delete cascade,
+  created_at timestamptz not null default now(),
+  requested_by text,
+  title text not null check (char_length(title) between 1 and 150),
+  instructions text check (char_length(instructions) <= 1000),
+  due_date date,
+  status text not null default 'requested'
+    check (status in ('requested','received','accepted','needs_retry','waived')),
+  staff_reason text check (char_length(staff_reason) <= 500)
+);
+
+create table if not exists public.case_documents (
+  id uuid primary key default gen_random_uuid(),
+  application_id uuid not null references public.applications(id) on delete cascade,
+  request_id uuid not null references public.document_requests(id) on delete cascade,
+  uploaded_at timestamptz not null default now(),
+  storage_path text not null unique,
+  filename text not null check (char_length(filename) <= 200),
+  size_bytes bigint,
+  mime text
+);
+
+/* Messages the applicant CAN see in "Check my case". Internal notes live in application_notes. */
+create table if not exists public.case_messages (
+  id bigint generated always as identity primary key,
+  application_id uuid not null references public.applications(id) on delete cascade,
+  created_at timestamptz not null default now(),
+  author text,
+  body text not null check (char_length(body) between 1 and 2000)
+);
+
+create table if not exists public.staff (email text primary key);
+alter table public.staff enable row level security;
+revoke all on public.staff from anon, authenticated;
+
+/* ---------- Functions ---------- */
+create or replace function public.is_staff() returns boolean
+language sql stable security definer set search_path = public as $$
+  select exists (select 1 from public.staff
+                 where lower(email) = lower(coalesce(auth.jwt() ->> 'email', '')));
+$$;
+
+create or replace function public.norm_code(p text) returns text
+language sql immutable as $$
+  select upper(regexp_replace(coalesce(p, ''), '[^A-Za-z0-9]', '', 'g'));
+$$;
+
+/* 10 random characters from an alphabet without look-alikes (no 0/O, 1/I/L). About 49 bits. */
+create or replace function public.make_access_code() returns text
+language plpgsql volatile set search_path = public, extensions as $$
+declare
+  alphabet constant text := 'ABCDEFGHJKMNPQRSTUVWXYZ23456789';
+  b bytea := gen_random_bytes(10);
+  code text := '';
+  i int;
+begin
+  for i in 0..9 loop
+    code := code || substr(alphabet, (get_byte(b, i) % 31) + 1, 1);
+  end loop;
+  return code;
+end $$;
+
+/* Internal: returns the application id if the case number and code match, else null. */
+create or replace function public.verify_case(p_case text, p_code text) returns uuid
+language plpgsql security definer set search_path = public, extensions as $$
+declare
+  v_id uuid; v_hash text; c text := public.norm_code(p_code);
+begin
+  select id, access_code_hash into v_id, v_hash from public.applications
+   where case_number = upper(regexp_replace(coalesce(p_case, ''), '\s', '', 'g'));
+  if v_id is null or v_hash is null then
+    perform crypt(c, gen_salt('bf', 8));  /* same work either way, so timing reveals nothing */
+    return null;
+  end if;
+  if length(c) <> 10 or crypt(c, v_hash) <> v_hash then return null; end if;
+  return v_id;
+end $$;
+
+create or replace function public.application_before_insert() returns trigger
+language plpgsql set search_path = public as $$
+begin
+  new.created_at := now(); new.updated_at := now();
+  new.case_number := 'AYR-' || to_char(now(), 'YY') || '-' || lpad(nextval('public.case_number_seq')::text, 5, '0');
+  new.stage := 'new'; new.assigned_to := null; new.next_followup := null;
+  new.closed_reason := null; new.closed_at := null;
+  new.priority := case
+    when new.unsafe_now then 'urgent'
+    when 'Shelter' = any(new.needs)
+         and new.sleeping_location in ('Outside','Vehicle','Tent or encampment') then 'high'
+    else 'normal' end;
+  return new;
+end $$;
+drop trigger if exists application_before_insert on public.applications;
+create trigger application_before_insert before insert on public.applications
+  for each row execute function public.application_before_insert();
+
+create or replace function public.application_before_update() returns trigger
+language plpgsql as $$
+begin
+  new.updated_at := now();
+  if new.stage = 'closed' and old.stage <> 'closed' then new.closed_at := now(); end if;
+  if new.stage <> 'closed' then new.closed_at := null; new.closed_reason := null; end if;
+  return new;
+end $$;
+drop trigger if exists application_before_update on public.applications;
+create trigger application_before_update before update on public.applications
+  for each row execute function public.application_before_update();
+
+/* Public: submit an application. Returns the case number and the access code (shown once). */
+create or replace function public.submit_application(payload jsonb) returns jsonb
+language plpgsql security definer set search_path = public, extensions as $$
+declare v_code text := public.make_access_code(); v_case text;
+begin
+  insert into public.applications (full_name, preferred_name, language, contact_method, phone, email,
+    contact_notes, area, sleeping_location, homeless_duration, household_adults, household_children,
+    unsafe_now, pets, needs, needs_detail, accommodations, consent, access_code_hash)
+  values (
+    trim(payload->>'full_name'), nullif(trim(payload->>'preferred_name'), ''), nullif(payload->>'language', ''),
+    payload->>'contact_method', nullif(trim(payload->>'phone'), ''), nullif(trim(payload->>'email'), ''),
+    nullif(trim(payload->>'contact_notes'), ''), trim(payload->>'area'),
+    nullif(payload->>'sleeping_location', ''), nullif(payload->>'homeless_duration', ''),
+    (payload->>'household_adults')::int, (payload->>'household_children')::int,
+    coalesce((payload->>'unsafe_now')::boolean, false),
+    coalesce(payload->'pets', '[]'::jsonb),
+    coalesce(array(select jsonb_array_elements_text(coalesce(payload->'needs', '[]'::jsonb))), '{}'),
+    nullif(trim(payload->>'needs_detail'), ''), nullif(trim(payload->>'accommodations'), ''),
+    coalesce((payload->>'consent')::boolean, false),
+    crypt(v_code, gen_salt('bf', 8)))
+  returning case_number into v_case;
+  return jsonb_build_object('case_number', v_case,
+                            'access_code', substr(v_code, 1, 5) || '-' || substr(v_code, 6, 5));
+end $$;
+
+/* Public: sign in to a case. Returns only what the applicant may see, or null if the pair is wrong. */
+create or replace function public.case_login(p_case text, p_code text) returns jsonb
+language plpgsql security definer set search_path = public, extensions as $$
+declare v_id uuid := public.verify_case(p_case, p_code);
+begin
+  if v_id is null then return null; end if;
+  return (select jsonb_build_object(
+    'case_number', a.case_number,
+    'name', coalesce(a.preferred_name, a.full_name),
+    'stage', a.stage,
+    'created_at', a.created_at,
+    'updated_at', a.updated_at,
+    'doc_folder', a.doc_folder,
+    'messages', coalesce((select jsonb_agg(jsonb_build_object('created_at', m.created_at, 'body', m.body)
+                                           order by m.created_at desc)
+                          from public.case_messages m where m.application_id = a.id), '[]'::jsonb),
+    'requests', coalesce((select jsonb_agg(jsonb_build_object(
+                            'id', r.id, 'title', r.title, 'instructions', r.instructions,
+                            'due_date', r.due_date, 'status', r.status, 'reason', r.staff_reason,
+                            'files', coalesce((select jsonb_agg(jsonb_build_object(
+                                        'filename', d.filename, 'uploaded_at', d.uploaded_at)
+                                        order by d.uploaded_at)
+                                      from public.case_documents d where d.request_id = r.id), '[]'::jsonb))
+                            order by r.created_at)
+                          from public.document_requests r where r.application_id = a.id), '[]'::jsonb))
+    from public.applications a where a.id = v_id);
+end $$;
+
+/* Public: record an uploaded file against an open document request. */
+create or replace function public.case_register_document(p_case text, p_code text, p_request uuid,
+  p_path text, p_filename text, p_size bigint, p_mime text) returns boolean
+language plpgsql security definer set search_path = public, extensions as $$
+declare v_id uuid := public.verify_case(p_case, p_code); v_folder uuid;
+begin
+  if v_id is null then return false; end if;
+  select doc_folder into v_folder from public.applications where id = v_id;
+  if not exists (select 1 from public.document_requests
+                  where id = p_request and application_id = v_id
+                    and status in ('requested','received','needs_retry')) then return false; end if;
+  if p_path not like v_folder::text || '/' || p_request::text || '/%' then return false; end if;
+  if not exists (select 1 from storage.objects where bucket_id = 'case-documents' and name = p_path) then
+    return false;
+  end if;
+  insert into public.case_documents (application_id, request_id, storage_path, filename, size_bytes, mime)
+    values (v_id, p_request, p_path, left(coalesce(p_filename, 'file'), 200), p_size, p_mime);
+  update public.document_requests set status = 'received', staff_reason = null where id = p_request;
+  return true;
+end $$;
+
+/* Storage rule helper: uploads are allowed only into the folder of a case that has an open request. */
+create or replace function public.can_upload(p_name text) returns boolean
+language sql stable security definer set search_path = public, storage as $$
+  select exists (
+    select 1 from public.applications a
+      join public.document_requests r on r.application_id = a.id
+     where a.doc_folder::text = (storage.foldername(p_name))[1]
+       and r.id::text = (storage.foldername(p_name))[2]
+       and r.status in ('requested','received','needs_retry')
+       and a.stage <> 'closed');
+$$;
+
+/* Staff: issue a new access code (the old one stops working). Returns the new code once. */
+create or replace function public.staff_reset_access_code(p_application uuid) returns text
+language plpgsql security definer set search_path = public, extensions as $$
+declare v_code text;
+begin
+  if not public.is_staff() then raise exception 'not allowed'; end if;
+  v_code := public.make_access_code();
+  update public.applications
+     set access_code_hash = crypt(v_code, gen_salt('bf', 8)), doc_folder = gen_random_uuid()
+   where id = p_application;
+  insert into public.application_notes (application_id, author, kind, body)
+    values (p_application, auth.jwt() ->> 'email', 'update', 'Access code reset');
+  return substr(v_code, 1, 5) || '-' || substr(v_code, 6, 5);
+end $$;
+
+revoke execute on function public.is_staff(), public.norm_code(text), public.make_access_code(),
+  public.verify_case(text, text), public.submit_application(jsonb), public.case_login(text, text),
+  public.case_register_document(text, text, uuid, text, text, bigint, text), public.can_upload(text),
+  public.staff_reset_access_code(uuid) from public, anon, authenticated;
+grant execute on function public.submit_application(jsonb), public.case_login(text, text),
+  public.case_register_document(text, text, uuid, text, text, bigint, text), public.can_upload(text) to anon;
+grant execute on function public.is_staff(), public.staff_reset_access_code(uuid) to authenticated;
+
+/* ---------- Row level security ---------- */
+alter table public.applications enable row level security;
+alter table public.application_notes enable row level security;
+alter table public.document_requests enable row level security;
+alter table public.case_documents enable row level security;
+alter table public.case_messages enable row level security;
+
+drop policy if exists "public can apply" on public.applications;
+drop policy if exists "staff read applications" on public.applications;
+drop policy if exists "staff update applications" on public.applications;
+drop policy if exists "staff read notes" on public.application_notes;
+drop policy if exists "staff add notes" on public.application_notes;
+drop policy if exists "staff manage requests" on public.document_requests;
+drop policy if exists "staff read documents" on public.case_documents;
+drop policy if exists "staff read messages" on public.case_messages;
+drop policy if exists "staff add messages" on public.case_messages;
+
+create policy "staff read applications" on public.applications
+  for select to authenticated using (public.is_staff());
+create policy "staff update applications" on public.applications
+  for update to authenticated using (public.is_staff()) with check (public.is_staff());
+create policy "staff read notes" on public.application_notes
+  for select to authenticated using (public.is_staff());
+create policy "staff add notes" on public.application_notes
+  for insert to authenticated with check (public.is_staff());
+create policy "staff manage requests" on public.document_requests
+  for all to authenticated using (public.is_staff()) with check (public.is_staff());
+create policy "staff read documents" on public.case_documents
+  for select to authenticated using (public.is_staff());
+create policy "staff read messages" on public.case_messages
+  for select to authenticated using (public.is_staff());
+create policy "staff add messages" on public.case_messages
+  for insert to authenticated with check (public.is_staff());
+
+/* Grants (least privilege). Applicants have NO direct table access: they use the functions above. */
+revoke all on public.applications, public.application_notes, public.document_requests,
+  public.case_documents, public.case_messages from anon, authenticated;
+grant select on public.applications to authenticated;
+grant update (stage, priority, assigned_to, next_followup, closed_reason) on public.applications to authenticated;
+grant select, insert on public.application_notes to authenticated;
+grant select, insert on public.document_requests to authenticated;
+grant update (title, instructions, due_date, status, staff_reason) on public.document_requests to authenticated;
+grant select on public.case_documents to authenticated;
+grant select, insert on public.case_messages to authenticated;
+grant usage on sequence public.application_notes_id_seq, public.case_messages_id_seq to authenticated;
+
+/* ---------- Private document storage ----------
+   If the bucket insert is rejected, create a PRIVATE bucket named case-documents in Storage
+   (10 MB limit, allowed types image/jpeg, image/png, application/pdf) and run the policies below. */
+insert into storage.buckets (id, name, public, file_size_limit, allowed_mime_types)
+values ('case-documents', 'case-documents', false, 10485760, array['image/jpeg','image/png','application/pdf'])
+on conflict (id) do update
+  set public = false, file_size_limit = excluded.file_size_limit, allowed_mime_types = excluded.allowed_mime_types;
+
+drop policy if exists "applicants upload to open requests" on storage.objects;
+drop policy if exists "staff read case documents" on storage.objects;
+drop policy if exists "staff delete case documents" on storage.objects;
+create policy "applicants upload to open requests" on storage.objects
+  for insert to anon with check (bucket_id = 'case-documents' and public.can_upload(name));
+create policy "staff read case documents" on storage.objects
+  for select to authenticated using (bucket_id = 'case-documents' and public.is_staff());
+create policy "staff delete case documents" on storage.objects
+  for delete to authenticated using (bucket_id = 'case-documents' and public.is_staff());
+
+/* ---------- LAST STEP: add yourself as staff ----------
+   Replace the placeholder with your sign-in email. Skip if you already added yourself. */
+delete from public.staff where email = 'you@example.org';
+insert into public.staff (email) values ('put-your-email-here') on conflict do nothing;
+================================================================
+BEFORE LAUNCH: fill in the yellow blanks (class "todo") in the footer and privacy notice.
+Decide how long you keep documents after a case closes, and delete them on that schedule.
+-->
+
+<style>
+:root{--primary:#4338a0;--primary-dark:#2f2778;--accent:#b45309;--text:#1f2937;--muted:#4b5563;--soft:#f3f4fb;--focus:#ffbf47;--error:#b91c1c;--ok:#166534;--line:#cbd0d8}
+*{margin:0;padding:0;box-sizing:border-box}
+[hidden]{display:none!important}
+html{scroll-behavior:smooth;scroll-padding-top:80px}
+body{font-family:system-ui,-apple-system,"Segoe UI",Roboto,Arial,sans-serif;line-height:1.65;color:var(--text);background:var(--soft);font-size:1.0625rem}
+:focus-visible{outline:3px solid var(--focus);outline-offset:3px;box-shadow:0 0 0 6px var(--primary-dark)}
+h1[tabindex="-1"]:focus,h2[tabindex="-1"]:focus,h4[tabindex="-1"]:focus,main:focus{outline:none;box-shadow:none}
+a{color:var(--primary)}
+.skip-link{position:absolute;left:-9999px;top:0;background:var(--primary-dark);color:#fff;padding:.8rem 1.2rem;z-index:1000;font-weight:700}
+.skip-link:focus{left:0}
+.visually-hidden{position:absolute!important;width:1px;height:1px;overflow:hidden;clip:rect(0 0 0 0);white-space:nowrap}
+.hp{position:absolute;left:-9999px;width:1px;height:1px;overflow:hidden}
+
+header{background:var(--primary-dark);color:#fff;position:sticky;top:0;z-index:50;box-shadow:0 2px 10px rgba(0,0,0,.2)}
+header nav{max-width:1300px;margin:0 auto;display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:.5rem;padding:.8rem 1.2rem}
+.logo{font-size:1.3rem;font-weight:800;color:#fff;text-decoration:none}
+.nav-links{display:flex;gap:.4rem;list-style:none;flex-wrap:wrap}
+.nav-links a{color:#fff;text-decoration:none;padding:.6rem .9rem;border-radius:6px;display:inline-block;min-height:44px}
+.nav-links a:hover,.nav-links a[aria-current=page]{background:rgba(255,255,255,.2);text-decoration:underline}
+
+.wrap{max-width:820px;margin:0 auto;padding:2rem 1.2rem 3rem}
+.wrap.wide{max-width:1300px}
+h1{font-size:clamp(1.8rem,5vw,2.4rem);line-height:1.2;color:var(--primary-dark);margin-bottom:.8rem}
+h2{font-size:1.4rem;color:var(--primary);margin-bottom:.8rem}
+h3{font-size:1.1rem;color:var(--primary-dark);margin:1rem 0 .4rem}
+h4{font-size:1.05rem;color:var(--primary-dark)}
+.lead{font-size:1.1rem;margin-bottom:1.2rem}
+.panel{background:#fff;border-radius:14px;padding:1.5rem;margin-bottom:1.2rem;box-shadow:0 3px 12px rgba(0,0,0,.07)}
+.panel.narrow{max-width:460px;margin:1rem auto}
+.panel h3:first-child{margin-top:0}
+.panel-lite{background:var(--soft);border-radius:10px;padding:.9rem;margin:1rem 0}
+.alert-banner{background:#fff7e6;border-left:6px solid var(--accent);padding:1rem 1.2rem;border-radius:8px;margin-bottom:1.2rem;color:#78350f}
+.error-summary{background:#fee2e2;border:3px solid var(--error);color:#7f1d1d;border-radius:10px;padding:1rem 1.2rem;margin-bottom:1.2rem}
+.error-summary h2{color:#7f1d1d;font-size:1.15rem}
+.error-summary ul{padding-left:1.2rem}
+.error-summary a{color:#7f1d1d;font-weight:700}
+
+.btn{display:inline-block;min-height:48px;padding:.8rem 1.8rem;border-radius:50px;font-weight:700;font-size:1.05rem;text-decoration:none;border:2px solid transparent;cursor:pointer;font-family:inherit}
+.btn-sm{min-height:44px;padding:.45rem 1.1rem;font-size:.95rem}
+.btn-primary{background:var(--primary);color:#fff}
+.btn-primary:hover{background:var(--primary-dark)}
+.btn-primary:disabled{opacity:.6;cursor:wait}
+.btn-outline{background:#fff;color:var(--primary);border-color:var(--primary)}
+.btn-outline:hover{background:var(--soft)}
+.linklike{background:none;border:0;font:inherit;color:var(--primary);text-decoration:underline;cursor:pointer;padding:.2rem .1rem;text-align:left}
+
+.field{margin-bottom:1.1rem}
+label,legend{display:block;font-weight:700;margin-bottom:.3rem}
+label.req::after,legend.req::after{content:" *";content:" *" / "";color:var(--error)}
+.hint{display:block;font-size:.92rem;color:var(--muted);font-weight:400}
+input[type=text],input[type=email],input[type=tel],input[type=number],input[type=date],input[type=password],input[type=search],select,textarea{width:100%;padding:.75rem;font-size:1rem;border:2px solid #6b7280;border-radius:8px;font-family:inherit;background:#fff;color:var(--text)}
+input[type=file]{width:100%;padding:.6rem;border:2px dashed #6b7280;border-radius:8px;background:#fff;font:inherit}
+textarea{min-height:96px;resize:vertical}
+[aria-invalid=true]{border-color:var(--error)!important}
+.error-msg{color:var(--error);font-size:.92rem;font-weight:600;margin-top:.3rem}
+fieldset{border:2px solid var(--line);border-radius:10px;padding:.9rem 1rem;margin-bottom:1.1rem}
+.check{display:flex;gap:.6rem;align-items:flex-start;margin-bottom:.5rem}
+.check input{width:24px;height:24px;margin-top:.2rem;flex-shrink:0}
+.check label{font-weight:400;margin:0}
+.grid2{display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:0 1rem}
+.row{display:flex;gap:.6rem;flex-wrap:wrap;align-items:center}
+.row input{flex:1;min-width:160px}
+.status{padding:.8rem 1rem;border-radius:8px;margin-top:1rem;font-weight:600}
+.status.ok{background:#dcfce7;color:var(--ok);border:2px solid var(--ok)}
+.status.err{background:#fee2e2;color:var(--error);border:2px solid var(--error)}
+.status:empty{display:none}
+.small-note{font-size:.92rem;color:var(--muted);margin-top:.9rem}
+.pet{border:2px solid var(--line);border-radius:12px;padding:1rem;margin-bottom:1rem}
+.pet-head{display:flex;justify-content:space-between;align-items:center;margin-bottom:.5rem}
+.pet-head h3{margin:0}
+mark.todo{background:#fde68a;color:#78350f;padding:0 .3rem;border-radius:3px;font-weight:600}
+
+/* Case number + access code */
+.codebox{border:3px solid var(--primary);border-radius:12px;padding:1rem 1.2rem;margin:1rem 0;background:#fff}
+.big{font-size:1.6rem;font-weight:800;letter-spacing:.08em;font-family:ui-monospace,Menlo,Consolas,monospace;overflow-wrap:anywhere}
+
+/* Applicant portal */
+.stepper{list-style:none;display:grid;grid-template-columns:repeat(auto-fit,minmax(110px,1fr));gap:.5rem;margin:1rem 0}
+.stepper li{border:2px solid var(--line);border-radius:10px;padding:.4rem .5rem;font-size:.88rem;text-align:center;color:var(--muted)}
+.stepper li.done{border-color:var(--ok);color:var(--ok)}
+.stepper li[aria-current=step]{border-color:var(--primary);background:var(--primary);color:#fff;font-weight:700}
+.docreq{border:2px solid var(--line);border-radius:10px;padding:.8rem;margin-bottom:.8rem;background:#fff}
+.files{list-style:none;margin:.4rem 0}
+.files li{margin-bottom:.2rem}
+.upload-form{margin-top:.6rem;padding-top:.6rem;border-top:1px dashed var(--line)}
+
+/* Staff pipeline */
+.toolbar{display:flex;gap:.6rem;flex-wrap:wrap;align-items:center;justify-content:space-between;margin-bottom:.8rem}
+.stats{list-style:none;display:grid;grid-template-columns:repeat(auto-fit,minmax(140px,1fr));gap:.8rem;margin:1rem 0}
+.stat{background:#fff;border:1px solid var(--line);border-radius:10px;padding:.7rem;text-align:center}
+.stat-n{font-size:1.8rem;font-weight:800;color:var(--primary)}
+.filters{display:flex;gap:1rem;flex-wrap:wrap;align-items:flex-end;background:#fff;border:1px solid var(--line);border-radius:12px;padding:1rem;margin-bottom:1rem}
+.filters .field{margin:0;flex:1;min-width:170px}
+.board{display:grid;grid-auto-flow:column;grid-auto-columns:minmax(270px,1fr);gap:1rem;overflow-x:auto;padding-bottom:1rem}
+.col{background:#fff;border:1px solid var(--line);border-radius:12px;padding:1rem;min-width:270px}
+.col h3{margin:0;display:flex;justify-content:space-between;align-items:center;color:var(--primary)}
+.count{background:var(--primary);color:#fff;border-radius:999px;padding:0 .65rem;font-size:.85rem}
+.col-help{font-size:.85rem;color:var(--muted);margin:.2rem 0 .8rem}
+.cards-list{list-style:none;display:grid;gap:.6rem}
+.empty{color:var(--muted);font-size:.9rem}
+.case-card{width:100%;text-align:left;background:#fff;border:2px solid var(--line);border-left-width:6px;border-radius:10px;padding:.7rem .8rem;display:grid;gap:.25rem;cursor:pointer;font:inherit;color:inherit}
+.case-card:hover{border-color:var(--primary)}
+.pr-urgent{border-left-color:#991b1b}.pr-high{border-left-color:#c2410c}.pr-normal{border-left-color:#6b7280}
+.card-top{display:flex;justify-content:space-between;gap:.5rem;align-items:center}
+.meta{font-size:.88rem;color:var(--muted)}
+.overdue{color:var(--error);font-weight:700}
+.chips{display:flex;flex-wrap:wrap;gap:.3rem}
+.chip{background:var(--soft);border:1px solid var(--line);border-radius:999px;padding:0 .6rem;font-size:.8rem;color:var(--text)}
+.chip-alert{background:#fff7e6;border-color:var(--accent);color:#78350f;font-weight:700}
+.badge{display:inline-block;padding:0 .55rem;border-radius:999px;font-weight:700;font-size:.78rem}
+.b-urgent{background:#fee2e2;color:#991b1b;border:1px solid #991b1b}
+.b-high{background:#ffedd5;color:#9a3412;border:1px solid #9a3412}
+.b-ok{background:#dcfce7;color:#166534;border:1px solid #166534}
+.b-none{background:#e5e7eb;color:#374151;border:1px solid #6b7280}
+.case-grid{display:grid;grid-template-columns:1.1fr 1fr;gap:1.5rem}
+.kv>div{display:grid;grid-template-columns:150px 1fr;gap:.5rem;padding:.2rem 0;border-bottom:1px solid #eef0f4}
+.kv dt{font-weight:700;color:var(--muted);font-size:.92rem}
+.pre{white-space:pre-wrap;overflow-wrap:anywhere}
+.petcard{background:var(--soft);border-radius:8px;padding:.6rem .8rem;margin-bottom:.5rem}
+.log{list-style:none;margin-top:1rem}
+.log li{border-left:4px solid var(--primary);background:var(--soft);padding:.5rem .8rem;margin-bottom:.6rem;border-radius:0 8px 8px 0}
+.log-h{font-size:.88rem;color:var(--muted)}
+
+/* Dialogs */
+dialog{border:none;border-radius:14px;padding:0;max-width:640px;width:calc(100% - 2rem);box-shadow:0 20px 60px rgba(0,0,0,.4);margin:auto}
+dialog.wide{max-width:1100px}
+dialog::backdrop{background:rgba(17,24,39,.75)}
+.dlg-body{padding:1.5rem;max-height:90vh;overflow-y:auto}
+.dlg-head{display:flex;justify-content:space-between;align-items:flex-start;gap:1rem;margin-bottom:.8rem}
+.dlg-head h2{margin:0}
+.close-btn{background:none;border:2px solid var(--muted);border-radius:8px;width:44px;height:44px;font-size:1.4rem;cursor:pointer;color:var(--text);flex-shrink:0}
+.legal-text p,.legal-text li{margin-bottom:.6rem}
+.legal-text ul{padding-left:1.3rem}
+
+footer{background:#1f2937;color:#fff;text-align:center;padding:2rem 1.2rem}
+footer p{margin-bottom:.4rem}
+footer .linklike,footer a{color:#c7d2fe}
+footer .linklike{padding:.6rem .7rem;min-height:44px}
+
+@media (max-width:800px){.board{display:block}.col{margin-bottom:1rem}.case-grid{grid-template-columns:1fr}.kv>div{grid-template-columns:1fr}}
+@media (prefers-reduced-motion:reduce){*{animation:none!important;transition:none!important;scroll-behavior:auto!important}}
+@media (forced-colors:active){.btn,.panel,.case-card,.codebox{border:2px solid ButtonText}}
+@media print{header,footer,.skip-link,.row,#intro,.alert-banner{display:none!important}body{background:#fff}}
+</style>
+</head>
+
+<body>
+<a href="#main" class="skip-link">Skip to main content</a>
+<noscript><div class="alert-banner">This page needs JavaScript. To reach us without it, email <a href="mailto:info@ayrahsfoundation.org">info@ayrahsfoundation.org</a>.</div></noscript>
+
+<header>
+  <nav aria-label="Main">
+    <a href="#apply" class="logo"><span aria-hidden="true">🐾</span> Ayrah's Foundation</a>
+    <ul class="nav-links">
+      <li><a href="#apply" id="nav-apply">Apply for help</a></li>
+      <li><a href="#status" id="nav-status">Check my case</a></li>
+      <li><a href="#staff" id="nav-staff">Staff sign-in</a></li>
+    </ul>
+  </nav>
+</header>
+
+<main id="main" tabindex="-1">
+
+<!-- ============ PUBLIC APPLICATION ============ -->
+<section id="apply" class="wrap" aria-labelledby="apply-title">
+  <h1 id="apply-title" tabindex="-1">Apply for Help</h1>
+  <div id="intro">
+    <p class="lead">Ayrah's Foundation helps people experiencing homelessness stay together with their pets. Tell us what's going on and what you need. This takes about 5 to 10 minutes. You can skip anything you're not comfortable answering, except the questions marked with a star. When you finish, you'll get a <strong>case number</strong> and an <strong>access code</strong> so you can check your status and upload documents we ask for.</p>
+    <div class="alert-banner" role="note"><strong>In an emergency, call 911.</strong> For housing and support referrals, dial <strong>211</strong>. For crisis support, call or text <strong>988</strong>. This form is not monitored around the clock.</div>
+  </div>
+
+  <div id="error-summary" class="error-summary" role="alert" tabindex="-1" hidden></div>
+
+  <form id="apply-form" novalidate>
+
+    <section class="panel" aria-labelledby="s1">
+      <h2 id="s1">1. About you</h2>
+      <div class="field"><label for="full_name" class="req">Your name</label><input id="full_name" type="text" autocomplete="name" maxlength="200" required aria-describedby="full_name-err"><div class="error-msg" id="full_name-err"></div></div>
+      <div class="field"><label for="preferred_name">What should we call you? <span class="hint">Optional</span></label><input id="preferred_name" type="text" maxlength="200" autocomplete="nickname"></div>
+      <div class="field"><label for="language">Preferred language</label>
+        <select id="language"><option value="English">English</option><option value="Spanish" lang="es">Español (Spanish)</option><option value="Other">Other</option></select></div>
+
+      <fieldset aria-describedby="contact_method-err">
+        <legend class="req">Best way to reach you <span class="visually-hidden">(required)</span></legend>
+        <div class="check"><input type="radio" name="contact_method" id="meth-call" value="Phone call"><label for="meth-call">Phone call</label></div>
+        <div class="check"><input type="radio" name="contact_method" id="meth-text" value="Text message"><label for="meth-text">Text message</label></div>
+        <div class="check"><input type="radio" name="contact_method" id="meth-email" value="Email"><label for="meth-email">Email</label></div>
+        <div class="check"><input type="radio" name="contact_method" id="meth-other" value="Through someone else"><label for="meth-other">Through a friend, family member, or case worker</label></div>
+        <div class="check"><input type="radio" name="contact_method" id="meth-person" value="Find me in person"><label for="meth-person">Find me in person</label></div>
+        <div class="error-msg" id="contact_method-err"></div>
+      </fieldset>
+      <div class="grid2">
+        <div class="field"><label for="phone">Phone number</label><input id="phone" type="tel" autocomplete="tel" maxlength="40" aria-describedby="phone-err"><div class="error-msg" id="phone-err"></div></div>
+        <div class="field"><label for="email">Email address</label><input id="email" type="email" autocomplete="email" maxlength="254" aria-describedby="email-err"><div class="error-msg" id="email-err"></div></div>
+      </div>
+      <div class="field"><label for="contact_notes">Contact notes <span class="hint">Best times to reach you, whether we can leave a voicemail, or who or where to find you</span></label><textarea id="contact_notes" maxlength="1000" aria-describedby="contact_notes-err"></textarea><div class="error-msg" id="contact_notes-err"></div></div>
+    </section>
+
+    <section class="panel" aria-labelledby="s2">
+      <h2 id="s2">2. Your situation</h2>
+      <div class="field"><label for="area" class="req">Where are you staying or spending most of your time?</label><input id="area" type="text" maxlength="300" required aria-describedby="area-hint area-err"><span class="hint" id="area-hint">A city, ZIP code, or nearby cross streets is fine. We don't need an exact address.</span><div class="error-msg" id="area-err"></div></div>
+      <div class="field"><label for="sleeping_location" class="req">Where are you sleeping right now?</label>
+        <select id="sleeping_location" required aria-describedby="sleeping_location-err">
+          <option value="">Select…</option>
+          <option value="Outside">Outside (street, park, etc.)</option>
+          <option value="Vehicle">In a vehicle</option>
+          <option value="Tent or encampment">Tent or encampment</option>
+          <option value="Shelter">In a shelter</option>
+          <option value="Motel or hotel">Motel or hotel</option>
+          <option value="With friends or family">With friends or family</option>
+          <option value="About to lose housing">About to lose my housing</option>
+          <option value="Other">Other</option>
+        </select><div class="error-msg" id="sleeping_location-err"></div></div>
+      <div class="field"><label for="homeless_duration">How long without stable housing? <span class="hint">Optional</span></label>
+        <select id="homeless_duration"><option value="">Select…</option><option>Less than 1 month</option><option>1 to 6 months</option><option>6 to 12 months</option><option>More than 1 year</option><option>Prefer not to say</option></select></div>
+      <div class="grid2">
+        <div class="field"><label for="household_adults">Adults in your household, including you</label><input id="household_adults" type="number" inputmode="numeric" min="0" max="30"></div>
+        <div class="field"><label for="household_children">Children under 18 with you</label><input id="household_children" type="number" inputmode="numeric" min="0" max="30"></div>
+      </div>
+      <div class="check"><input type="checkbox" id="unsafe_now" aria-controls="unsafe-alert"><label for="unsafe_now">Someone (me or my pet) is in danger or needs urgent medical care right now.</label></div>
+      <div id="unsafe-alert" class="alert-banner" role="alert" hidden><strong>Please call 911 now.</strong> We'll mark your application urgent, but this form is not monitored around the clock.</div>
+    </section>
+
+    <section class="panel" aria-labelledby="s3">
+      <h2 id="s3">3. Your pet or pets</h2>
+      <p class="small-note" style="margin:0 0 1rem">Tell us about each animal you have with you. If you don't have a pet, you can skip this section and still apply.</p>
+      <div id="pets"></div>
+      <button type="button" class="btn btn-outline btn-sm" id="add-pet">Add another pet</button>
+      <p class="visually-hidden" id="pet-live" role="status" aria-live="polite"></p>
+    </section>
+
+    <section class="panel" aria-labelledby="s4">
+      <h2 id="s4">4. What help do you need?</h2>
+      <fieldset aria-describedby="needs-err">
+        <legend class="req">Choose everything that applies <span class="visually-hidden">(at least one required)</span></legend>
+        <div class="check"><input type="checkbox" name="needs" id="need-food" value="Food for me"><label for="need-food">Food for me</label></div>
+        <div class="check"><input type="checkbox" name="needs" id="need-petfood" value="Food for my pet"><label for="need-petfood">Food for my pet</label></div>
+        <div class="check"><input type="checkbox" name="needs" id="need-supplies" value="Pet supplies"><label for="need-supplies">Pet supplies (leash, crate, bedding, etc.)</label></div>
+        <div class="check"><input type="checkbox" name="needs" id="need-shelter" value="Shelter"><label for="need-shelter">A place to stay (shelter)</label></div>
+        <div class="check"><input type="checkbox" name="needs" id="need-housing" value="Housing help"><label for="need-housing">Help finding permanent housing</label></div>
+        <div class="check"><input type="checkbox" name="needs" id="need-vet" value="Vet care"><label for="need-vet">Veterinary care</label></div>
+        <div class="check"><input type="checkbox" name="needs" id="need-transport" value="Transportation"><label for="need-transport">Transportation</label></div>
+        <div class="check"><input type="checkbox" name="needs" id="need-docs" value="ID and documents"><label for="need-docs">ID and documents</label></div>
+        <div class="check"><input type="checkbox" name="needs" id="need-other" value="Something else"><label for="need-other">Something else</label></div>
+        <div class="error-msg" id="needs-err"></div>
+      </fieldset>
+      <div class="field"><label for="needs_detail">Tell us more <span class="hint">Optional. What's going on, and what would help most?</span></label><textarea id="needs_detail" maxlength="3000"></textarea></div>
+      <div class="field"><label for="accommodations">Do you need any accommodations to receive help? <span class="hint">Optional. For example mobility, hearing, vision, or language support. Please don't include medical records or diagnoses.</span></label><textarea id="accommodations" maxlength="1500"></textarea></div>
+    </section>
+
+    <section class="panel" aria-labelledby="s5">
+      <h2 id="s5">5. Review and submit</h2>
+      <div class="check"><input type="checkbox" id="consent" required aria-describedby="consent-err"><label for="consent" class="req">I confirm this information is true to the best of my knowledge. I agree that Ayrah's Foundation may contact me about this request and may share only what's needed with partners, such as shelters, housing providers, or veterinarians, to arrange help.</label></div>
+      <div class="error-msg" id="consent-err"></div>
+      <p class="small-note">Please don't include Social Security numbers, ID numbers, immigration status, bank details, or medical records in this form. If we need a document later, we'll ask for it through your case. Read our <button type="button" class="linklike" data-open="dlg-privacy">Privacy Notice</button>.</p>
+      <div class="hp" aria-hidden="true"><label for="hp">Leave this field empty</label><input type="text" id="hp" tabindex="-1" autocomplete="off"></div>
+      <p style="margin-top:1rem"><button type="submit" class="btn btn-primary" id="submit-btn">Submit application</button></p>
+      <p class="small-note">Submitting this form does not guarantee help or a response time. If we can't help directly, we'll do our best to point you to other resources.</p>
+      <div class="status" id="submit-status" role="status" aria-live="polite"></div>
+    </section>
+  </form>
+
+  <div id="confirm" class="panel" hidden>
+    <h2 id="confirm-title" tabindex="-1">Thank you. We received your application.</h2>
+    <div class="codebox">
+      <h3>Save these now</h3>
+      <dl class="kv">
+        <div><dt>Case number</dt><dd><span class="big" id="cn-vis" aria-hidden="true"></span><span class="visually-hidden" id="cn-sr"></span></dd></div>
+        <div><dt>Access code</dt><dd><span class="big" id="ac-vis" aria-hidden="true"></span><span class="visually-hidden" id="ac-sr"></span></dd></div>
+      </dl>
+      <p><strong>This is the only time we will show your access code.</strong> Write it down, take a screenshot, or save it with the buttons below. You need both to check your status and upload documents. Anyone who has both can see your case, so keep them private.</p>
+      <div class="row">
+        <button type="button" class="btn btn-outline btn-sm" id="copy-codes">Copy</button>
+        <button type="button" class="btn btn-outline btn-sm" id="save-codes">Save as text file</button>
+        <button type="button" class="btn btn-outline btn-sm" id="print-codes">Print</button>
+      </div>
+      <div class="status" id="copy-status" role="status" aria-live="polite"></div>
+    </div>
+    <h3>What happens next</h3>
+    <p>A member of our team will reach out using the contact method you chose, as soon as we can. You can check your status and upload documents any time at <a href="#status">Check my case</a>. If things change or become urgent, <strong>call 911</strong> for emergencies, dial <strong>211</strong> for housing and support referrals, or call or text <strong>988</strong> for crisis support.</p>
+    <p style="margin-top:1rem"><button type="button" class="btn btn-outline" id="another">Submit another application</button></p>
+  </div>
+</section>
+
+<!-- ============ APPLICANT PORTAL ============ -->
+<section id="portal" class="wrap" aria-labelledby="portal-title" hidden>
+  <h1 id="portal-title" tabindex="-1">Check My Case</h1>
+  <p class="visually-hidden" id="p-live" role="status" aria-live="polite"></p>
+
+  <div id="p-login" class="panel narrow">
+    <p class="lead">See your status, read updates from our team, and upload documents we ask for.</p>
+    <form id="p-login-form" novalidate>
+      <div class="field"><label for="p-case">Case number</label><input id="p-case" type="text" autocomplete="username" autocapitalize="characters" spellcheck="false" aria-describedby="p-case-hint"><span class="hint" id="p-case-hint">Example: AYR-26-00042</span></div>
+      <div class="field"><label for="p-code">Access code</label><input id="p-code" type="password" autocomplete="current-password" autocapitalize="characters" spellcheck="false" aria-describedby="p-code-hint"><span class="hint" id="p-code-hint">10 letters and numbers, like K7QM4-TXD9H</span></div>
+      <div class="check"><input type="checkbox" id="p-show"><label for="p-show">Show my access code</label></div>
+      <button type="submit" class="btn btn-primary" id="p-login-btn">View my case</button>
+      <div class="status" id="p-login-msg" role="status" aria-live="polite"></div>
+    </form>
+    <p class="small-note">You got your case number and access code when you applied. Lost them? Email <a href="mailto:info@ayrahsfoundation.org">info@ayrahsfoundation.org</a> and we'll confirm it's you and give you a new access code. Don't have a case yet? <a href="#apply">Apply for help</a>.</p>
+  </div>
+
+  <div id="p-dash" hidden></div>
+</section>
+
+<!-- ============ STAFF PIPELINE ============ -->
+<section id="staff" class="wrap wide" aria-labelledby="staff-title" hidden>
+  <h1 id="staff-title" tabindex="-1">Staff Pipeline</h1>
+
+  <div id="demo-banner" class="alert-banner" role="note" hidden>
+    <strong>Demo mode.</strong> No database is connected, so this preview keeps data only in this session and doesn't ask you to sign in. Once you add your Supabase keys, staff must sign in and only approved staff can see applications.
+    <p style="margin-top:.6rem" class="row"><button type="button" class="btn btn-outline btn-sm" id="btn-seed">Load sample applications</button><button type="button" class="btn btn-outline btn-sm" id="btn-clear">Clear demo data</button></p>
+    <p class="small-note" id="demo-hint"></p>
+  </div>
+
+  <div id="login-panel" class="panel narrow" hidden>
+    <h2>Staff sign-in</h2>
+    <p class="small-note" style="margin:0 0 1rem">For approved Ayrah's Foundation staff only.</p>
+    <form id="login-form" novalidate>
+      <div class="field"><label for="login-email">Email</label><input id="login-email" type="email" autocomplete="username"></div>
+      <div class="field"><label for="login-pw">Password</label><input id="login-pw" type="password" autocomplete="current-password"></div>
+      <button type="submit" class="btn btn-primary" id="login-btn">Sign in</button>
+      <div class="status" id="login-msg" role="status" aria-live="polite"></div>
+    </form>
+  </div>
+
+  <div id="dash" hidden>
+    <div class="toolbar">
+      <p><span id="who"></span></p>
+      <div class="row">
+        <button type="button" class="btn btn-outline btn-sm" id="btn-refresh">Refresh</button>
+        <button type="button" class="btn btn-outline btn-sm" id="btn-signout">Sign out</button>
+      </div>
+    </div>
+    <ul class="stats" id="stats" aria-label="Summary"></ul>
+    <div class="filters" role="search">
+      <div class="field"><label for="f-q">Search</label><input id="f-q" type="search" placeholder="Name, case number, or area"></div>
+      <div class="field"><label for="f-pr">Priority</label><select id="f-pr"><option value="">All</option><option value="urgent">Urgent</option><option value="high">High</option><option value="normal">Normal</option></select></div>
+      <div class="field"><label for="f-as">Assigned</label><select id="f-as"><option value="">Everyone</option><option value="me">Assigned to me</option><option value="none">Unassigned</option></select></div>
+      <div class="check" style="margin:0"><input type="checkbox" id="f-closed"><label for="f-closed">Show closed</label></div>
+    </div>
+    <p class="visually-hidden" id="board-status" role="status" aria-live="polite"></p>
+    <div id="board" class="board" role="region" aria-label="Applications by stage" tabindex="0"></div>
+  </div>
+</section>
+</main>
+
+<footer>
+  <p><strong>Ayrah's Foundation</strong> · 501(c)(3) Tax-Exempt Nonprofit · EIN 33-2899814</p>
+  <p><mark class="todo">[Mailing address]</mark></p>
+  <p>Email: <a href="mailto:info@ayrahsfoundation.org">info@ayrahsfoundation.org</a></p>
+  <p><button type="button" class="linklike" data-open="dlg-privacy">Privacy Notice</button> · <a href="#status">Check my case</a> · <a href="#staff">Staff sign-in</a></p>
+</footer>
+
+<!-- PRIVACY NOTICE (applicants) -->
+<dialog id="dlg-privacy" aria-labelledby="t-priv">
+  <div class="dlg-body">
+    <div class="dlg-head"><h2 id="t-priv">Privacy Notice for Applicants</h2><button type="button" class="close-btn" data-close aria-label="Close privacy notice">×</button></div>
+    <div class="legal-text">
+      <p><em>Effective October 10, 2026. Our full Privacy Policy is on our main website.</em></p>
+      <ul>
+        <li><strong>What we collect.</strong> What you enter in the application, plus any documents you upload when we ask for them.</li>
+        <li><strong>Case number and access code.</strong> You get them when you apply. We keep only a scrambled version of your access code, so we can't read it back. Anyone who has both can see your case, so keep them private. If you lose your code, contact us and we'll issue a new one after confirming who you are.</li>
+        <li><strong>Documents.</strong> Stored in a private, secure area. Only approved staff can open them.</li>
+        <li><strong>Why.</strong> To understand your needs, contact you, and arrange food, supplies, shelter, veterinary care, and housing help.</li>
+        <li><strong>Who sees it.</strong> Approved Ayrah's Foundation staff who sign in to our secure system. We do not sell your information.</li>
+        <li><strong>Who we share it with.</strong> Only what's needed, with partners that help arrange the help you asked for (such as shelters, housing providers, or veterinarians) and with service providers that host our systems. We may also share information if the law requires it or to protect someone's safety.</li>
+        <li><strong>Please don't include</strong> Social Security numbers, ID numbers, immigration status, bank details, or medical records in the application form. We'll only ask for a document when we need it to arrange help.</li>
+        <li><strong>How long we keep it.</strong> Only as long as needed to help you and meet our legal and record-keeping duties.</li>
+        <li><strong>Your choices.</strong> Email us to review, correct, or ask us to delete your information. We'll honor reasonable requests, except where we must keep records by law.</li>
+      </ul>
+      <p>Contact: <a href="mailto:info@ayrahsfoundation.org">info@ayrahsfoundation.org</a> · <mark class="todo">[Mailing address]</mark></p>
+    </div>
+  </div>
+</dialog>
+
+<!-- CASE DETAIL (staff) -->
+<dialog id="dlg-case" class="wide" aria-labelledby="case-title">
+  <div class="dlg-body">
+    <div class="dlg-head"><div><h2 id="case-title"></h2><p id="case-sub" class="meta"></p></div><button type="button" class="close-btn" data-close aria-label="Close case">×</button></div>
+    <div id="case-body"></div>
+  </div>
+</dialog>
+
+<script>
+/* ================= CONFIG =================
+   Paste your Supabase project URL and publishable key. Until you do, the page runs in
+   demo mode (data stays in this preview only, and the staff view needs no sign-in).
+   The publishable key is safe in public code because of the security rules in the SQL
+   above. NEVER paste a secret or service_role key here. */
+const SUPABASE_URL = "";  // e.g. "https://abcdefgh.supabase.co"
+const SUPABASE_KEY = "";  // starts with sb_publishable_ (legacy anon key also works)
+const LIVE = !!(SUPABASE_URL && SUPABASE_KEY);
+const LEGACY_KEY = SUPABASE_KEY.slice(0,3)==='eyJ';
+const CONTACT_EMAIL = "info@ayrahsfoundation.org";
+
+/* ================= HELPERS ================= */
+const $=(s,r=document)=>r.querySelector(s);
+const $$=(s,r=document)=>Array.from(r.querySelectorAll(s));
+const esc=s=>String(s==null?'':s).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+const uuid=()=>crypto.randomUUID?crypto.randomUUID():'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g,c=>{const r=crypto.getRandomValues(new Uint8Array(1))[0]&15;return(c==='x'?r:(r&3|8)).toString(16)});
+const refCode=id=>'AYR-'+String(id).slice(0,8).toUpperCase();
+const caseNo=a=>a.case_number||refCode(a.id);
+const spell=s=>String(s).split('').map(c=>c==='-'?'dash':c).join(', ');
+const todayStr=()=>new Date().toLocaleDateString('en-CA');
+const fmt=(iso,t)=>{const d=new Date(iso);return isNaN(d)?'':d.toLocaleString(undefined,t?{dateStyle:'medium',timeStyle:'short'}:{dateStyle:'medium'})};
+const fmtDay=s=>new Date(s+'T00:00:00').toLocaleDateString(undefined,{month:'short',day:'numeric'});
+const ago=iso=>{const n=Math.floor((Date.now()-new Date(iso))/864e5);return n<=0?'today':n===1?'1 day ago':n+' days ago'};
+const emailRe=/^[^\s@]+@[^\s@]+\.[^\s@]{2,}$/;
+const isEmail=x=>!!x&&emailRe.test(x);
+
+const STAGES=[
+ {k:'new',name:'New',help:'Just received. Needs a first contact.'},
+ {k:'contacting',name:'Contacting',help:'Trying to reach the applicant.'},
+ {k:'screening',name:'Needs Assessment',help:'In touch. Confirming needs and pet details.'},
+ {k:'active',name:'Services Active',help:'Food, supplies, vet care, or shelter being arranged or delivered.'},
+ {k:'housing',name:'Housing Pathway',help:'Working toward permanent housing.'},
+ {k:'followup',name:'Follow-Up',help:'Placed or stable. Checking in.'},
+ {k:'closed',name:'Closed',help:'No further action needed.'}
+];
+const stageName=k=>(STAGES.find(s=>s.k===k)||{name:k}).name;
+const PR={urgent:0,high:1,normal:2};
+const KIND={note:'Note',contact_attempt:'Contact attempt',referral:'Referral',service:'Service delivered',update:'Case update'};
+/* What applicants see for each stage (plain language) */
+const PUB={
+ new:['Received','We have your application. A member of our team will contact you using the way you chose to be reached.'],
+ contacting:['We are trying to reach you','Our team is trying to reach you. If your phone number or email has changed, please contact us so we can find you.'],
+ screening:['Reviewing your needs','We are talking with you about what you and your pet need.'],
+ active:['Help in progress','We are arranging or delivering help, like food, supplies, vet care, or a place to stay.'],
+ housing:['Working on housing','We are working with you toward permanent housing.'],
+ followup:['Checking in','You are in a steadier place now. We will keep checking in with you.'],
+ closed:['Closed','This case is closed. If you still need help, contact us or submit a new application.']
+};
+const STEPS=['new','contacting','screening','active','housing','followup'];
+const STEP_LABEL={new:'Received',contacting:'Contact',screening:'Needs review',active:'Help in progress',housing:'Housing',followup:'Check-ins'};
+const REQ_PUB={requested:['Needed','b-high'],received:['Received. We are reviewing it.','b-ok'],accepted:['Accepted. Thank you!','b-ok'],needs_retry:['Please send it again','b-urgent'],waived:['No longer needed','b-none']};
+const RS={requested:'Requested',received:'Received (needs review)',accepted:'Accepted',needs_retry:'Needs another try',waived:'Not needed'};
+const state={apps:[],current:null,review:new Set(),docMap:{},reqMap:{}};
+let session=LIVE?null:{email:'demo@preview'};
+
+/* Mirrors the database trigger (demo mode only) */
+function suggestPriority(a){
+  if(a.unsafe_now) return 'urgent';
+  if((a.needs||[]).includes('Shelter')&&['Outside','Vehicle','Tent or encampment'].includes(a.sleeping_location)) return 'high';
+  return 'normal';
+}
+
+/* ================= DATA LAYER ================= */
+async function refreshSession(){
+  const res=await fetch(SUPABASE_URL+'/auth/v1/token?grant_type=refresh_token',{method:'POST',headers:{apikey:SUPABASE_KEY,'Content-Type':'application/json'},body:JSON.stringify({refresh_token:session.refresh_token})});
+  const j=await res.json();
+  if(!res.ok){session=null;const e=new Error('auth');e.auth=true;throw e}
+  setSession(j);
+}
+function setSession(j,fb){session={access_token:j.access_token,refresh_token:j.refresh_token,email:(j.user&&j.user.email)||(session&&session.email)||fb,expires_at:Date.now()+(j.expires_in||3600)*1000}}
+/* anon=true sends the request as the public (applicants), never with a staff session */
+async function sb(path,opts,anon){
+  opts=opts||{};
+  if(!anon&&session&&session.refresh_token&&Date.now()>session.expires_at-60000) await refreshSession();
+  const headers=Object.assign({apikey:SUPABASE_KEY,'Content-Type':'application/json'},opts.headers||{});
+  if(!anon&&session) headers.Authorization='Bearer '+session.access_token;
+  else if(LEGACY_KEY) headers.Authorization='Bearer '+SUPABASE_KEY;
+  const res=await fetch(SUPABASE_URL+path,Object.assign({},opts,{headers}));
+  if(res.status===401&&!anon){const e=new Error('auth');e.auth=true;throw e}
+  if(!res.ok){const e=new Error((await res.text())||res.statusText);e.status=res.status;throw e}
+  return (res.headers.get('content-type')||'').includes('json')?res.json():null;
+}
+const rpc=(n,a,anon)=>sb('/rest/v1/rpc/'+n,{method:'POST',body:JSON.stringify(a)},anon);
+const post=(t,b)=>sb('/rest/v1/'+t,{method:'POST',headers:{Prefer:'return=minimal'},body:JSON.stringify(b)});
+const patch=(t,id,b)=>sb('/rest/v1/'+t+'?id=eq.'+encodeURIComponent(id),{method:'PATCH',headers:{Prefer:'return=minimal'},body:JSON.stringify(b)});
+
+/* Demo storage (preview only; never used when LIVE) */
+const demoApi={
+  async _put(k,v){if(!window.storage) throw new Error('No storage');const r=await window.storage.set(k,JSON.stringify(v),false);if(!r) throw new Error('save failed')},
+  async _get(k){try{const r=await window.storage.get(k,false);return r?JSON.parse(r.value):null}catch(e){return null}},
+  async _keys(p){try{const r=await window.storage.list(p,false);return(r&&r.keys)||[]}catch(e){return[]}},
+  async _all(p){const ks=await this._keys(p);return(await Promise.all(ks.map(k=>this._get(k)))).filter(Boolean)},
+  _code(){const A='ABCDEFGHJKMNPQRSTUVWXYZ23456789',b=crypto.getRandomValues(new Uint8Array(10));return Array.from(b,x=>A[x%31]).join('')},
+  async submit(p){
+    const id=uuid(),n=((await this._get('meta:seq'))||0)+1,code=this._code(),now=new Date().toISOString();
+    await this._put('meta:seq',n);
+    const cn='AYR-'+String(new Date().getFullYear()).slice(2)+'-'+String(n).padStart(5,'0');
+    await this._put('app:'+id,Object.assign({},p,{id,case_number:cn,access_code:code,doc_folder:uuid(),stage:'new',priority:suggestPriority(p),assigned_to:null,next_followup:null,closed_reason:null,created_at:now,updated_at:now}));
+    return {case_number:cn,access_code:code.slice(0,5)+'-'+code.slice(5)};
+  },
+  async caseLogin(c,k){
+    const cn=String(c).replace(/\s/g,'').toUpperCase(),code=String(k).replace(/[^A-Za-z0-9]/g,'').toUpperCase();
+    const a=(await this._all('app:')).find(x=>x.case_number===cn&&x.access_code===code);
+    if(!a) return null;
+    const msgs=(await this._all('msg:'+a.id+':')).sort((x,y)=>y.created_at.localeCompare(x.created_at)).map(m=>({created_at:m.created_at,body:m.body}));
+    const reqs=(await this._all('req:'+a.id+':')).sort((x,y)=>x.created_at.localeCompare(y.created_at));
+    const docs=await this._all('doc:'+a.id+':');
+    return {case_number:a.case_number,name:a.preferred_name||a.full_name,stage:a.stage,created_at:a.created_at,updated_at:a.updated_at,doc_folder:a.doc_folder,messages:msgs,
+      requests:reqs.map(r=>({id:r.id,title:r.title,instructions:r.instructions,due_date:r.due_date,status:r.status,reason:r.staff_reason,files:docs.filter(d=>d.request_id===r.id).map(d=>({filename:d.filename,uploaded_at:d.uploaded_at}))}))};
+  },
+  async uploadDoc(view,code,req,blob,mime,name){
+    if(blob.size>2*1048576) throw new Error('size');
+    const data=await new Promise((res,rej)=>{const fr=new FileReader();fr.onload=()=>res(fr.result);fr.onerror=rej;fr.readAsDataURL(blob)});
+    const a=(await this._all('app:')).find(x=>x.case_number===view.case_number),id=uuid();
+    await this._put('doc:'+a.id+':'+id,{id,application_id:a.id,request_id:req.id,filename:name,size_bytes:blob.size,mime,uploaded_at:new Date().toISOString(),data});
+    await this.updateRequest(req.id,{status:'received',staff_reason:null});
+  },
+  async list(){return(await this._all('app:')).sort((a,b)=>b.created_at.localeCompare(a.created_at))},
+  async update(id,p){const a=await this._get('app:'+id);if(a) await this._put('app:'+id,Object.assign({},a,p,{updated_at:new Date().toISOString()}))},
+  async notes(id){return(await this._all('note:'+id+':')).sort((a,b)=>b.created_at.localeCompare(a.created_at))},
+  async addNote(n){await this._put('note:'+n.application_id+':'+Date.now()+Math.random().toString(36).slice(2,6),Object.assign({},n,{created_at:new Date().toISOString()}))},
+  async requests(id){
+    const reqs=(await this._all('req:'+id+':')).sort((a,b)=>a.created_at.localeCompare(b.created_at)),docs=await this._all('doc:'+id+':');
+    return reqs.map(r=>Object.assign({},r,{case_documents:docs.filter(d=>d.request_id===r.id)}));
+  },
+  async addRequest(r){const id=uuid();await this._put('req:'+r.application_id+':'+id,Object.assign({},r,{id,status:'requested',staff_reason:null,created_at:new Date().toISOString()}))},
+  async updateRequest(id,p){const k=(await this._keys('req:')).find(x=>x.endsWith(':'+id));if(!k) return;await this._put(k,Object.assign({},await this._get(k),p))},
+  async messages(id){return(await this._all('msg:'+id+':')).sort((a,b)=>b.created_at.localeCompare(a.created_at))},
+  async addMessage(m){await this._put('msg:'+m.application_id+':'+Date.now()+Math.random().toString(36).slice(2,6),Object.assign({},m,{created_at:new Date().toISOString()}))},
+  async resetCode(id){
+    const a=await this._get('app:'+id),code=this._code();
+    await this._put('app:'+id,Object.assign({},a,{access_code:code,doc_folder:uuid()}));
+    await this.addNote({application_id:id,author:'demo@preview',kind:'update',body:'Access code reset'});
+    return code.slice(0,5)+'-'+code.slice(5);
+  },
+  async docUrl(d){
+    const parts=d.data.split(','),mime=parts[0].match(/:(.*?);/)[1],bin=atob(parts[1]),u8=new Uint8Array(bin.length);
+    for(let i=0;i<bin.length;i++) u8[i]=bin.charCodeAt(i);
+    return URL.createObjectURL(new Blob([u8],{type:mime}));
+  },
+  async reviewQueue(){return(await this._all('req:')).filter(r=>r.status==='received').map(r=>({application_id:r.application_id}))},
+  async clear(){for(const p of['app:','note:','req:','doc:','msg:','meta:']) for(const k of await this._keys(p)) try{await window.storage.delete(k,false)}catch(e){}}
+};
+
+const api=LIVE?{
+  submit:p=>rpc('submit_application',{payload:p},true),
+  caseLogin:(c,k)=>rpc('case_login',{p_case:c,p_code:k},true),
+  async uploadDoc(view,code,req,blob,mime,name){
+    const ext={'image/jpeg':'jpg','image/png':'png','application/pdf':'pdf'}[mime];
+    const path=view.doc_folder+'/'+req.id+'/'+uuid()+'.'+ext;
+    const h={apikey:SUPABASE_KEY,'Content-Type':mime,'x-upsert':'false'};
+    if(LEGACY_KEY) h.Authorization='Bearer '+SUPABASE_KEY;
+    const up=await fetch(SUPABASE_URL+'/storage/v1/object/case-documents/'+path,{method:'POST',headers:h,body:blob});
+    if(!up.ok) throw new Error('upload');
+    const ok=await rpc('case_register_document',{p_case:view.case_number,p_code:code,p_request:req.id,p_path:path,p_filename:name,p_size:blob.size,p_mime:mime},true);
+    if(!ok) throw new Error('register');
+  },
+  list:()=>sb('/rest/v1/applications?select=*&order=created_at.desc&limit=1000'),
+  update:(id,p)=>patch('applications',id,p),
+  notes:id=>sb('/rest/v1/application_notes?application_id=eq.'+encodeURIComponent(id)+'&order=created_at.desc'),
+  addNote:n=>post('application_notes',n),
+  requests:id=>sb('/rest/v1/document_requests?application_id=eq.'+encodeURIComponent(id)+'&select=*,case_documents(*)&order=created_at.asc'),
+  addRequest:r=>post('document_requests',r),
+  updateRequest:(id,p)=>patch('document_requests',id,p),
+  messages:id=>sb('/rest/v1/case_messages?application_id=eq.'+encodeURIComponent(id)+'&order=created_at.desc'),
+  addMessage:m=>post('case_messages',m),
+  resetCode:id=>rpc('staff_reset_access_code',{p_application:id}),
+  async docUrl(d){const r=await sb('/storage/v1/object/sign/case-documents/'+d.storage_path,{method:'POST',body:JSON.stringify({expiresIn:120})});return SUPABASE_URL+'/storage/v1'+r.signedURL},
+  reviewQueue:()=>sb('/rest/v1/document_requests?status=eq.received&select=application_id')
+}:demoApi;
+
+/* ================= DIALOGS ================= */
+$$('[data-open]').forEach(b=>b.addEventListener('click',()=>{const d=document.getElementById(b.dataset.open);d._returnTo=b;d.showModal()}));
+$$('dialog').forEach(d=>{
+  d.addEventListener('click',e=>{if(e.target===d) d.close()});
+  d.addEventListener('close',()=>{if(d._returnTo) d._returnTo.focus()});
+  $('[data-close]',d).addEventListener('click',()=>d.close());
+});
+
+/* ================= ROUTING ================= */
+const VIEWS={apply:{nav:'nav-apply',h:'apply-title',t:'Apply for Help'},portal:{nav:'nav-status',h:'portal-title',t:'Check My Case'},staff:{nav:'nav-staff',h:'staff-title',t:'Staff Pipeline'}};
+function route(first){
+  const h=location.hash,view=h==='#staff'?'staff':h==='#status'?'portal':'apply';
+  Object.keys(VIEWS).forEach(k=>{$('#'+k).hidden=k!==view;$('#'+VIEWS[k].nav).removeAttribute('aria-current')});
+  $('#'+VIEWS[view].nav).setAttribute('aria-current','page');
+  document.title=VIEWS[view].t+" – Ayrah's Foundation";
+  if(view!=='portal') portalSignOut(true);
+  if(view==='staff') showStaff();
+  if(!first) $('#'+VIEWS[view].h).focus();
+}
+window.addEventListener('hashchange',()=>route(false));
+
+/* ================= APPLICATION FORM ================= */
+let petSeq=0,lastCodes=null;
+function petHTML(n){const p='pet'+n;return `
+<div class="pet">
+  <div class="pet-head"><h3 class="pet-title">Pet</h3><button type="button" class="btn btn-outline btn-sm pet-remove">Remove</button></div>
+  <div class="grid2">
+    <div class="field"><label for="${p}-name">Name <span class="hint">Optional</span></label><input id="${p}-name" class="p-name" type="text" maxlength="100" autocomplete="off"></div>
+    <div class="field"><label for="${p}-type">Type</label><select id="${p}-type" class="p-type" aria-describedby="${p}-type-err"><option value="">Select…</option><option>Dog</option><option>Cat</option><option>Other</option></select><div class="error-msg" id="${p}-type-err"></div></div>
+    <div class="field"><label for="${p}-size">Size</label><select id="${p}-size" class="p-size"><option value="">Select…</option><option>Small (under 25 lb)</option><option>Medium (25 to 60 lb)</option><option>Large (over 60 lb)</option></select></div>
+    <div class="field"><label for="${p}-age">Approximate age <span class="hint">Example: 3 years</span></label><input id="${p}-age" class="p-age" type="text" maxlength="40" autocomplete="off"></div>
+    <div class="field"><label for="${p}-vax">Vaccinated?</label><select id="${p}-vax" class="p-vax"><option value="">Select…</option><option>Yes</option><option>No</option><option>Not sure</option></select></div>
+    <div class="field"><label for="${p}-fixed">Spayed or neutered?</label><select id="${p}-fixed" class="p-fixed"><option value="">Select…</option><option>Yes</option><option>No</option><option>Not sure</option></select></div>
+  </div>
+  <div class="field"><label for="${p}-notes">Anything we should know? <span class="hint">Optional. Health needs, behavior, or a service animal.</span></label><textarea id="${p}-notes" class="p-notes" maxlength="500"></textarea></div>
+</div>`}
+function renumberPets(){
+  const blocks=$$('.pet');
+  blocks.forEach((b,i)=>{$('.pet-title',b).textContent='Pet '+(i+1);const rm=$('.pet-remove',b);rm.hidden=blocks.length===1;rm.setAttribute('aria-label','Remove pet '+(i+1))});
+  $('#add-pet').hidden=blocks.length>=5;
+}
+function addPet(focus){
+  if($$('.pet').length>=5) return;
+  petSeq++;$('#pets').insertAdjacentHTML('beforeend',petHTML(petSeq));renumberPets();
+  if(focus){$('#pet'+petSeq+'-name').focus();$('#pet-live').textContent='Pet '+$$('.pet').length+' added.'}
+}
+function resetPets(){$('#pets').innerHTML='';petSeq=0;addPet(false)}
+$('#add-pet').addEventListener('click',()=>addPet(true));
+$('#pets').addEventListener('click',e=>{
+  const rm=e.target.closest('.pet-remove');if(!rm) return;
+  rm.closest('.pet').remove();renumberPets();$('#pet-live').textContent='Pet removed.';$('#add-pet').focus();
+});
+$('#unsafe_now').addEventListener('change',e=>{$('#unsafe-alert').hidden=!e.target.checked});
+
+function readPets(){
+  return $$('.pet').map(b=>({name:$('.p-name',b).value.trim(),type:$('.p-type',b).value,size:$('.p-size',b).value,age:$('.p-age',b).value.trim(),vaccinated:$('.p-vax',b).value,fixed:$('.p-fixed',b).value,notes:$('.p-notes',b).value.trim()})).filter(p=>Object.values(p).some(Boolean));
+}
+function clearErrors(){
+  $$('#apply-form .error-msg').forEach(e=>e.textContent='');
+  $$('#apply-form [aria-invalid]').forEach(e=>e.removeAttribute('aria-invalid'));
+  $('#error-summary').hidden=true;$('#error-summary').innerHTML='';
+}
+function validateApplication(){
+  const errs=[];
+  const fail=(el,msg,errId)=>{
+    const out=document.getElementById(errId||(el.id+'-err'));if(out) out.textContent=msg;
+    if(/^(INPUT|SELECT|TEXTAREA)$/.test(el.tagName)&&el.type!=='radio') el.setAttribute('aria-invalid','true');
+    errs.push({el,msg});
+  };
+  const val=id=>$('#'+id).value.trim();
+  if(!val('full_name')) fail($('#full_name'),'Enter your name.');
+  const m=($('input[name=contact_method]:checked')||{}).value;
+  if(!m) fail($('#meth-call'),'Choose the best way to reach you.','contact_method-err');
+  const phone=val('phone'),email=val('email'),needPhone=m==='Phone call'||m==='Text message';
+  if(phone&&phone.replace(/\D/g,'').length<7) fail($('#phone'),'Enter a valid phone number.');
+  else if(needPhone&&!phone) fail($('#phone'),'Enter a phone number so we can reach you.');
+  if(email&&!emailRe.test(email)) fail($('#email'),'Enter a valid email, like name@example.com.');
+  else if(m==='Email'&&!email) fail($('#email'),'Enter your email address.');
+  if((m==='Through someone else'||m==='Find me in person')&&!val('contact_notes')) fail($('#contact_notes'),'Tell us how or where we can reach you.');
+  if(!val('area')) fail($('#area'),'Tell us the general area where you are.');
+  if(!$('#sleeping_location').value) fail($('#sleeping_location'),'Choose where you are sleeping right now.');
+  $$('.pet').forEach((b,i)=>{
+    const any=['.p-name','.p-type','.p-size','.p-age','.p-vax','.p-fixed','.p-notes'].some(s=>$(s,b).value.trim());
+    if(any&&!$('.p-type',b).value) fail($('.p-type',b),'Choose a type for pet '+(i+1)+'.');
+  });
+  if(!$$('input[name=needs]:checked').length) fail($('#need-food'),'Choose at least one kind of help.','needs-err');
+  if(!$('#consent').checked) fail($('#consent'),'Please check the confirmation box to submit.');
+  return errs;
+}
+function showSummary(errs){
+  const box=$('#error-summary');
+  box.innerHTML='<h2>Please fix '+errs.length+(errs.length>1?' items':' item')+' before submitting</h2><ul>'+errs.map((e,i)=>'<li><a href="#" data-i="'+i+'">'+esc(e.msg)+'</a></li>').join('')+'</ul>';
+  box.hidden=false;box.focus();
+  box.onclick=ev=>{const a=ev.target.closest('a[data-i]');if(a){ev.preventDefault();errs[+a.dataset.i].el.focus()}};
+}
+function buildApp(){
+  const val=id=>$('#'+id).value.trim()||null;
+  const num=id=>{const x=$('#'+id).value;return x===''?null:Math.max(0,Math.min(30,parseInt(x,10)||0))};
+  return {
+    full_name:$('#full_name').value.trim(),preferred_name:val('preferred_name'),language:$('#language').value,
+    contact_method:$('input[name=contact_method]:checked').value,phone:val('phone'),email:val('email'),contact_notes:val('contact_notes'),
+    area:$('#area').value.trim(),sleeping_location:$('#sleeping_location').value,homeless_duration:$('#homeless_duration').value||null,
+    household_adults:num('household_adults'),household_children:num('household_children'),
+    unsafe_now:$('#unsafe_now').checked,pets:readPets(),needs:$$('input[name=needs]:checked').map(x=>x.value),
+    needs_detail:val('needs_detail'),accommodations:val('accommodations'),consent:true
+  };
+}
+function showConfirmation(r){
+  lastCodes=r;
+  $('#apply-form').hidden=true;$('#intro').hidden=true;$('#error-summary').hidden=true;
+  $('#cn-vis').textContent=r.case_number;$('#cn-sr').textContent=spell(r.case_number);
+  $('#ac-vis').textContent=r.access_code;$('#ac-sr').textContent=spell(r.access_code);
+  $('#copy-status').textContent='';$('#copy-status').className='status';
+  $('#confirm').hidden=false;$('#confirm-title').focus();
+}
+const codesText=()=>"Ayrah's Foundation\nCase number: "+lastCodes.case_number+"\nAccess code: "+lastCodes.access_code+"\nCheck your case: "+location.href.split('#')[0]+"#status\nKeep this private. Anyone who has both can see your case.\n";
+$('#copy-codes').addEventListener('click',async()=>{
+  const st=$('#copy-status');
+  try{await navigator.clipboard.writeText(codesText());st.className='status ok';st.textContent='Copied. Paste it somewhere safe.'}
+  catch(e){st.className='status err';st.textContent="Couldn't copy automatically. Please write the numbers down or take a screenshot."}
+});
+$('#save-codes').addEventListener('click',()=>{
+  const a=document.createElement('a');a.href=URL.createObjectURL(new Blob([codesText()],{type:'text/plain'}));
+  a.download='ayrahs-foundation-case-'+lastCodes.case_number+'.txt';document.body.appendChild(a);a.click();a.remove();
+});
+$('#print-codes').addEventListener('click',()=>window.print());
+
+const form=$('#apply-form');
+form.addEventListener('input',e=>{
+  const t=e.target;
+  if(t.getAttribute&&t.getAttribute('aria-invalid')){t.removeAttribute('aria-invalid');const o=document.getElementById(t.id+'-err');if(o) o.textContent=''}
+});
+form.addEventListener('change',e=>{
+  if(e.target.name==='contact_method') $('#contact_method-err').textContent='';
+  if(e.target.name==='needs') $('#needs-err').textContent='';
+});
+form.addEventListener('submit',async e=>{
+  e.preventDefault();clearErrors();
+  const st=$('#submit-status');st.className='status';st.textContent='';
+  const errs=validateApplication();
+  if(errs.length){showSummary(errs);return}
+  if($('#hp').value){st.className='status err';st.textContent='Something went wrong and your application was not saved. Please email '+CONTACT_EMAIL+'.';return}
+  const btn=$('#submit-btn');btn.disabled=true;btn.textContent='Submitting…';
+  try{
+    const r=await api.submit(buildApp());
+    if(!r||!r.case_number) throw new Error('no case');
+    showConfirmation(r);
+  }catch(err){
+    console.error(err);
+    st.className='status err';
+    st.textContent='Something went wrong and your application was not saved. Please try again, or email '+CONTACT_EMAIL+'.';
+  }finally{btn.disabled=false;btn.textContent='Submit application'}
+});
+$('#another').addEventListener('click',()=>{
+  form.reset();resetPets();$('#unsafe-alert').hidden=true;lastCodes=null;
+  ['cn-vis','cn-sr','ac-vis','ac-sr'].forEach(id=>$('#'+id).textContent='');
+  $('#confirm').hidden=true;form.hidden=false;$('#intro').hidden=false;$('#apply-title').focus();
+});
+
+/* ================= APPLICANT PORTAL ================= */
+let pSess=null,idleT=null;
+function bumpIdle(){clearTimeout(idleT);if(pSess) idleT=setTimeout(()=>portalSignOut(false,'You were signed out after 15 minutes without activity.'),15*60*1000)}
+['click','keydown','touchstart'].forEach(ev=>document.addEventListener(ev,()=>{if(pSess) bumpIdle()},{passive:true}));
+function portalSignOut(silent,msg){
+  pSess=null;clearTimeout(idleT);
+  $('#p-dash').innerHTML='';$('#p-dash').hidden=true;$('#p-login').hidden=false;
+  $('#p-case').value='';$('#p-code').value='';$('#p-show').checked=false;$('#p-code').type='password';
+  const m=$('#p-login-msg');m.className='status';m.textContent=silent?'':(msg||'You have been signed out.');
+  if(!silent) $('#p-case').focus();
+}
+$('#p-show').addEventListener('change',e=>{$('#p-code').type=e.target.checked?'text':'password'});
+
+function reqHTMLp(r){
+  const lab=(REQ_PUB[r.status]||[r.status,'b-none']),open=['requested','received','needs_retry'].includes(r.status);
+  return `<div class="docreq">
+    <div class="card-top"><h4 id="rq-${esc(r.id)}" tabindex="-1">${esc(r.title)}</h4><span class="badge ${lab[1]}">${esc(lab[0])}</span></div>
+    ${r.instructions?`<p class="pre">${esc(r.instructions)}</p>`:''}
+    ${r.due_date?`<p class="meta">Please send by ${esc(fmtDay(r.due_date))}</p>`:''}
+    ${r.status==='needs_retry'&&r.reason?`<p class="overdue">${esc(r.reason)}</p>`:''}
+    ${(r.files||[]).length?`<ul class="files">${r.files.map(f=>`<li>${esc(f.filename)} <span class="meta">sent ${esc(fmt(f.uploaded_at,true))}</span></li>`).join('')}</ul>`:''}
+    ${open?`<form class="upload-form" data-req="${esc(r.id)}" novalidate>
+      <label for="up-${esc(r.id)}">Choose a photo or PDF</label>
+      <input id="up-${esc(r.id)}" type="file" accept="image/*,application/pdf">
+      <span class="hint">JPG, PNG, or PDF. You can take a photo with your phone.</span>
+      <p style="margin-top:.6rem"><button type="submit" class="btn btn-primary btn-sm">Upload</button></p>
+      <div class="status" role="status" aria-live="polite"></div></form>`:''}
+  </div>`;
+}
+function renderPortal(v,focusSel){
+  const st=PUB[v.stage]||[v.stage,''],idx=STEPS.indexOf(v.stage);
+  const stepper=v.stage==='closed'?'':'<ol class="stepper" aria-label="Progress">'+STEPS.map((s,i)=>`<li${i===idx?' aria-current="step"':''}${i<idx?' class="done"':''}>${esc(STEP_LABEL[s])}${i<idx?'<span class="visually-hidden"> (done)</span>':''}${i===idx?'<span class="visually-hidden"> (current step)</span>':''}</li>`).join('')+'</ol>';
+  const reqs=v.requests||[],msgs=v.messages||[];
+  $('#p-login').hidden=true;
+  const d=$('#p-dash');d.hidden=false;
+  d.innerHTML=`
+  <div class="toolbar"><p class="small-note" style="margin:0">If you're on a shared computer, sign out when you're done.</p><div class="row"><button type="button" class="btn btn-outline btn-sm" id="p-refresh">Refresh</button><button type="button" class="btn btn-outline btn-sm" id="p-signout">Sign out</button></div></div>
+  <h2 id="p-case-title" tabindex="-1">Case ${esc(v.case_number)}</h2>
+  <p class="lead">Hello, ${esc(v.name)}.</p>
+  <section class="panel" aria-labelledby="p-st-h"><h3 id="p-st-h">Current status</h3><p><strong>${esc(st[0])}</strong></p><p>${esc(st[1])}</p>${stepper}<p class="meta">Applied ${esc(fmt(v.created_at))} · Last updated ${esc(fmt(v.updated_at))}</p></section>
+  <section class="panel" aria-labelledby="p-req-h"><h3 id="p-req-h">What we need from you</h3>${reqs.length?reqs.map(reqHTMLp).join(''):'<p>Nothing right now. If we need a document, it will show up here.</p>'}</section>
+  <section class="panel" aria-labelledby="p-msg-h"><h3 id="p-msg-h">Messages from our team</h3>${msgs.length?'<ol class="log">'+msgs.map(m=>`<li><div class="log-h">${esc(fmt(m.created_at,true))}</div><div class="pre">${esc(m.body)}</div></li>`).join('')+'</ol>':'<p>No messages yet.</p>'}</section>
+  <p class="small-note">Need to change your phone number or email, or have a question? Email <a href="mailto:${CONTACT_EMAIL}">${CONTACT_EMAIL}</a> and include your case number.</p>`;
+  ($(focusSel||'#p-case-title')||$('#p-case-title')).focus();
+}
+$('#p-login-form').addEventListener('submit',async e=>{
+  e.preventDefault();
+  const m=$('#p-login-msg');m.className='status';m.textContent='';
+  const c=$('#p-case').value.trim(),k=$('#p-code').value.trim();
+  if(!c||!k){m.className='status err';m.textContent='Enter your case number and access code.';return}
+  const b=$('#p-login-btn');b.disabled=true;
+  try{
+    const v=await api.caseLogin(c,k);
+    if(!v){m.className='status err';m.textContent="We couldn't find a case with that case number and access code. Check for typos and try again. If you lost them, email "+CONTACT_EMAIL+" and we'll help.";return}
+    pSess={c:v.case_number,k,view:v};$('#p-code').value='';renderPortal(v);bumpIdle();
+  }catch(err){console.error(err);m.className='status err';m.textContent='Something went wrong. Check your connection and try again.'}
+  finally{b.disabled=false}
+});
+async function portalRefresh(focusSel){
+  try{const v=await api.caseLogin(pSess.c,pSess.k);if(v){pSess.view=v;renderPortal(v,focusSel)}else portalSignOut(false,'Please sign in again.')}
+  catch(e){$('#p-live').textContent='Could not refresh. Check your connection.'}
+}
+$('#p-dash').addEventListener('click',e=>{
+  if(e.target.id==='p-refresh') portalRefresh();
+  if(e.target.id==='p-signout') portalSignOut(false,'You have been signed out.');
+});
+
+/* Photos are shrunk before upload so they work on slow connections */
+async function prepFile(file){
+  const t=file.type||(/\.pdf$/i.test(file.name)?'application/pdf':/\.jpe?g$/i.test(file.name)?'image/jpeg':/\.png$/i.test(file.name)?'image/png':'');
+  const MAX=10*1048576;
+  if(t==='application/pdf'){if(file.size>MAX) throw new Error('size');return{blob:file,mime:t}}
+  if(!t.startsWith('image/')) throw new Error('type');
+  try{
+    const bmp=await createImageBitmap(file,{imageOrientation:'from-image'});
+    const s=Math.min(1,2000/Math.max(bmp.width,bmp.height)),w=Math.round(bmp.width*s),h=Math.round(bmp.height*s);
+    const c=document.createElement('canvas');c.width=w;c.height=h;
+    const g=c.getContext('2d');g.fillStyle='#fff';g.fillRect(0,0,w,h);g.drawImage(bmp,0,0,w,h);
+    const blob=await new Promise(r=>c.toBlob(r,'image/jpeg',.85));
+    if(blob&&blob.size<file.size) return{blob,mime:'image/jpeg'};
+  }catch(e){}
+  if((t==='image/jpeg'||t==='image/png')&&file.size<=MAX) return{blob:file,mime:t};
+  throw new Error('type');
+}
+$('#p-dash').addEventListener('submit',async e=>{
+  const f=e.target.closest('.upload-form');if(!f) return;
+  e.preventDefault();
+  const st=$('.status',f),inp=$('input[type=file]',f),btn=$('button',f),file=inp.files[0];
+  st.className='status';st.textContent='';
+  if(!file){st.className='status err';st.textContent='Choose a file first.';inp.focus();return}
+  const req=pSess.view.requests.find(r=>r.id===f.dataset.req);
+  btn.disabled=true;st.textContent='Uploading…';
+  try{
+    const p=await prepFile(file);
+    await api.uploadDoc(pSess.view,pSess.k,req,p.blob,p.mime,file.name);
+    $('#p-live').textContent='Upload complete. Thank you.';
+    await portalRefresh('#rq-'+req.id);
+  }catch(err){
+    console.error(err);btn.disabled=false;st.className='status err';
+    st.textContent=err.message==='type'?'Please choose a JPG, PNG, or PDF file.':err.message==='size'?'That file is too large. Please choose one under 10 MB.':"The upload didn't work. Check your connection and try again.";
+  }
+});
+
+/* ================= STAFF PIPELINE ================= */
+function showStaff(){
+  const authed=!LIVE||!!session;
+  $('#demo-banner').hidden=LIVE;
+  $('#login-panel').hidden=authed;$('#dash').hidden=!authed;
+  $('#who').textContent=authed&&session?'Signed in as '+session.email:'';
+  $('#btn-signout').hidden=!LIVE;
+  if(authed) loadApps();
+}
+function authLost(){
+  session=null;if($('#dlg-case').open) $('#dlg-case').close();
+  showStaff();$('#login-msg').className='status err';$('#login-msg').textContent='Your session ended. Please sign in again.';
+}
+$('#login-form').addEventListener('submit',async e=>{
+  e.preventDefault();
+  const msg=$('#login-msg');msg.className='status';msg.textContent='';
+  const email=$('#login-email').value.trim(),pw=$('#login-pw').value;
+  if(!email||!pw){msg.className='status err';msg.textContent='Enter your email and password.';return}
+  const btn=$('#login-btn');btn.disabled=true;
+  try{
+    const res=await fetch(SUPABASE_URL+'/auth/v1/token?grant_type=password',{method:'POST',headers:{apikey:SUPABASE_KEY,'Content-Type':'application/json'},body:JSON.stringify({email,password:pw})});
+    const j=await res.json();
+    if(!res.ok) throw new Error('signin');
+    setSession(j,email);$('#login-pw').value='';showStaff();$('#staff-title').focus();
+  }catch(err){msg.className='status err';msg.textContent='Could not sign in. Check your email and password.'}
+  finally{btn.disabled=false}
+});
+$('#btn-signout').addEventListener('click',async()=>{
+  try{if(LIVE&&session) await fetch(SUPABASE_URL+'/auth/v1/logout',{method:'POST',headers:{apikey:SUPABASE_KEY,Authorization:'Bearer '+session.access_token}})}catch(e){}
+  session=null;state.apps=[];showStaff();$('#login-email').focus();
+});
+$('#btn-refresh').addEventListener('click',loadApps);
+document.addEventListener('visibilitychange',()=>{if(!document.hidden&&!$('#staff').hidden&&(!LIVE||session)&&!$('#dlg-case').open) loadApps()});
+
+async function refreshReview(){
+  try{const rq=await api.reviewQueue();state.review=new Set((rq||[]).map(x=>x.application_id));renderBoard()}catch(e){}
+}
+async function loadApps(){
+  $('#board-status').textContent='Loading applications…';
+  try{
+    const res=await Promise.all([api.list(),api.reviewQueue()]);
+    state.apps=res[0];state.review=new Set((res[1]||[]).map(x=>x.application_id));
+    renderBoard();
+    $('#board-status').textContent=state.apps.length+' applications loaded.';
+  }catch(e){
+    if(e.auth) return authLost();
+    $('#board-status').textContent='Could not load applications.';
+    $('#board').innerHTML='<p class="status err">Could not load applications. '+esc(e.status===403?'Your account may not have access. Confirm the SQL ran completely and your email is in the staff table.':'Check your connection and try again.')+'</p>';
+  }
+}
+const badge=p=>p==='urgent'?'<span class="badge b-urgent">Urgent</span>':p==='high'?'<span class="badge b-high">High</span>':'';
+function filtered(){
+  const q=$('#f-q').value.trim().toLowerCase(),pr=$('#f-pr').value,as=$('#f-as').value,closed=$('#f-closed').checked;
+  return state.apps.filter(a=>{
+    if(!closed&&a.stage==='closed') return false;
+    if(pr&&a.priority!==pr) return false;
+    if(as==='me'&&a.assigned_to!==(session&&session.email)) return false;
+    if(as==='none'&&a.assigned_to) return false;
+    if(q&&![a.full_name,a.preferred_name,a.area,caseNo(a),a.phone,a.email].join(' ').toLowerCase().includes(q)) return false;
+    return true;
+  });
+}
+function cardHTML(a){
+  const pets=(a.pets||[]).map(p=>p.type).filter(Boolean),needs=a.needs||[];
+  const fu=a.next_followup,t=todayStr(),over=fu&&fu<t&&a.stage!=='closed',due=fu&&fu===t;
+  return `<li><button type="button" class="case-card pr-${esc(a.priority)}" data-case="${esc(a.id)}" aria-haspopup="dialog">
+    <span class="card-top"><strong>${esc(a.preferred_name||a.full_name)}</strong>${badge(a.priority)}</span>
+    <span class="meta">${esc(caseNo(a))} · applied ${esc(ago(a.created_at))}</span>
+    ${pets.length?`<span class="meta">Pets: ${esc(pets.join(', '))}</span>`:''}
+    <span class="chips">${state.review.has(a.id)?'<span class="chip chip-alert">Documents to review</span>':''}${needs.slice(0,3).map(n=>`<span class="chip">${esc(n)}</span>`).join('')}${needs.length>3?`<span class="chip">+${needs.length-3} more</span>`:''}</span>
+    <span class="meta">${a.assigned_to?'Assigned: '+esc(a.assigned_to):'Unassigned'}</span>
+    ${fu?`<span class="meta ${over?'overdue':''}">${over?'Follow-up overdue: ':due?'Follow-up today: ':'Follow-up: '}${esc(fmtDay(fu))}</span>`:''}
+  </button></li>`;
+}
+function renderStats(){
+  const open=state.apps.filter(a=>a.stage!=='closed'),t=todayStr();
+  const s=[['New',state.apps.filter(a=>a.stage==='new').length],['Urgent (open)',open.filter(a=>a.priority==='urgent').length],['Documents to review',state.review.size],['Follow-ups due',open.filter(a=>a.next_followup&&a.next_followup<=t).length],['Open total',open.length]];
+  $('#stats').innerHTML=s.map(x=>`<li class="stat"><div class="stat-n">${x[1]}</div><div>${x[0]}</div></li>`).join('');
+}
+function renderBoard(){
+  const apps=filtered(),showClosed=$('#f-closed').checked;
+  const hint=state.apps.length?'':'<p class="status err" style="grid-column:1/-1">No applications yet. New submissions will appear here. If you expected some, confirm your sign-in email is in the staff table.</p>';
+  $('#board').innerHTML=hint+STAGES.filter(s=>showClosed||s.k!=='closed').map(s=>{
+    const items=apps.filter(a=>a.stage===s.k).sort((a,b)=>(PR[a.priority]??2)-(PR[b.priority]??2)||a.created_at.localeCompare(b.created_at));
+    return `<section class="col" aria-labelledby="col-${s.k}"><h3 id="col-${s.k}">${s.name} <span class="count">${items.length}</span></h3><p class="col-help">${s.help}</p><ul class="cards-list">${items.map(cardHTML).join('')||'<li class="empty">Nothing here</li>'}</ul></section>`;
+  }).join('');
+  renderStats();
+}
+['#f-q','#f-pr','#f-as','#f-closed'].forEach(s=>$(s).addEventListener('input',renderBoard));
+$('#board').addEventListener('click',e=>{const b=e.target.closest('[data-case]');if(b) openCase(b.dataset.case)});
+
+/* ----- Case detail ----- */
+const kv=(k,v)=>v?`<div><dt>${k}</dt><dd>${v}</dd></div>`:'';
+const pre=s=>s?`<span class="pre">${esc(s)}</span>`:'';
+function petCard(p){
+  const bits=[p.type,p.size,p.age&&('age '+p.age),p.vaccinated&&('vaccinated: '+p.vaccinated),p.fixed&&('spayed/neutered: '+p.fixed)].filter(Boolean).map(esc).join(' · ');
+  return `<div class="petcard"><strong>${esc(p.name||'Unnamed pet')}</strong><br>${bits}${p.notes?`<br><span class="pre">${esc(p.notes)}</span>`:''}</div>`;
+}
+function caseHTML(a){
+  const idx=STAGES.findIndex(s=>s.k===a.stage),next=STAGES[idx+1];
+  const opts=(list,sel)=>list.map(o=>`<option value="${esc(o[0])}"${o[0]===sel?' selected':''}>${esc(o[1])}</option>`).join('');
+  const phoneLink=a.phone?`<a href="tel:${esc(String(a.phone).replace(/[^\d+]/g,''))}">${esc(a.phone)}</a>`:'';
+  const emailLink=isEmail(a.email)?`<a href="mailto:${esc(a.email)}">${esc(a.email)}</a>`:esc(a.email);
+  const hh=(a.household_adults!=null||a.household_children!=null)?esc((a.household_adults==null?'?':a.household_adults)+' adult(s), '+(a.household_children||0)+' child(ren)'):'';
+  return `<div class="case-grid">
+  <div>
+    <h3>Contact</h3><dl class="kv">${kv('Preferred contact',esc(a.contact_method))}${kv('Phone',phoneLink)}${kv('Email',emailLink)}${kv('Contact notes',pre(a.contact_notes))}${kv('Language',esc(a.language))}</dl>
+    <h3>Situation</h3><dl class="kv">${kv('Area',esc(a.area))}${kv('Sleeping',esc(a.sleeping_location))}${kv('Without stable housing',esc(a.homeless_duration))}${kv('Household',hh)}${kv('Immediate danger',a.unsafe_now?'<strong class="overdue">Yes, flagged by applicant</strong>':'No')}</dl>
+    <h3>Pets</h3>${(a.pets||[]).length?a.pets.map(petCard).join(''):'<p>None listed.</p>'}
+    <h3>Needs</h3><p class="chips">${(a.needs||[]).map(n=>`<span class="chip">${esc(n)}</span>`).join('')}</p>${a.needs_detail?`<p class="pre">${esc(a.needs_detail)}</p>`:''}
+    ${a.accommodations?`<h3>Accommodations requested</h3><p class="pre">${esc(a.accommodations)}</p>`:''}
+  </div>
+  <div>
+    <form id="cm-form" novalidate>
+      <h3>Case management</h3>
+      <div class="field"><label for="cm-stage">Stage <span class="hint">Applicants see this as plain-language status.</span></label><select id="cm-stage">${opts(STAGES.map(s=>[s.k,s.name]),a.stage)}</select></div>
+      <div class="field" id="cm-closed-wrap" hidden><label for="cm-closed">Reason for closing</label><select id="cm-closed">${opts([['','Select a reason…'],['Housed or stable','Housed or stable'],['Referred elsewhere','Referred elsewhere'],['Unable to reach','Unable to reach'],['Withdrew','Withdrew'],['Not eligible or out of area','Not eligible or out of area'],['Other','Other']],a.closed_reason||'')}</select></div>
+      <div class="field"><label for="cm-priority">Priority <span class="hint">Suggested from the application. Change it if needed.</span></label><select id="cm-priority">${opts([['urgent','Urgent'],['high','High'],['normal','Normal']],a.priority)}</select></div>
+      <div class="field"><label for="cm-assigned">Assigned to</label><div class="row"><input id="cm-assigned" type="text" maxlength="120" value="${esc(a.assigned_to||'')}"><button type="button" class="btn btn-outline btn-sm" id="btn-assign-me">Assign to me</button></div></div>
+      <div class="field"><label for="cm-follow">Next follow-up date</label><input id="cm-follow" type="date" value="${esc(a.next_followup||'')}"></div>
+      <div class="row"><button type="submit" class="btn btn-primary btn-sm">Save changes</button>${a.stage!=='closed'&&next?`<button type="button" class="btn btn-outline btn-sm" id="btn-advance" data-next="${next.k}">${next.k==='closed'?'Close this case…':'Advance to '+esc(next.name)}</button>`:''}</div>
+      <div class="status" id="cm-status" role="status" aria-live="polite"></div>
+    </form>
+
+    <section class="panel-lite" aria-labelledby="acc-h"><h3 id="acc-h" style="margin-top:0">Applicant access</h3>
+      <p>Case number: <strong>${esc(caseNo(a))}</strong></p>
+      <p class="meta">The access code is stored scrambled and can't be viewed. If the applicant loses it, reset it after confirming who you are talking to.</p>
+      <p style="margin-top:.5rem"><button type="button" class="btn btn-outline btn-sm" id="btn-reset">Reset access code…</button></p>
+      <div id="reset-confirm" class="alert-banner" hidden style="margin-top:.6rem"><p>This stops the old code from working and gives you a new one to share. Continue?</p><div class="row" style="margin-top:.5rem"><button type="button" class="btn btn-primary btn-sm" id="btn-reset-yes">Yes, reset it</button><button type="button" class="btn btn-outline btn-sm" id="btn-reset-no">Cancel</button></div></div>
+      <div id="reset-result" class="status" role="status" aria-live="polite"></div>
+    </section>
+
+    <section aria-labelledby="doc-h"><h3 id="doc-h">Documents</h3>
+      <div id="doc-list"><p class="meta">Loading…</p></div>
+      <div class="status" id="doc-status" role="status" aria-live="polite"></div>
+      <form id="req-form" class="panel-lite" novalidate>
+        <h4>Request a document</h4>
+        <p class="meta">Only ask for what you need. Applicants upload photos or PDFs through Check my case.</p>
+        <div class="field"><label for="req-title">What do you need?</label><input id="req-title" list="doc-suggest" type="text" maxlength="150"><datalist id="doc-suggest"><option value="Pet vaccination record"><option value="Photo of my pet"><option value="Photo ID"><option value="Proof of income"><option value="Proof of address"><option value="Service animal documentation"></datalist></div>
+        <div class="field"><label for="req-inst">Instructions for the applicant <span class="hint">Optional</span></label><textarea id="req-inst" maxlength="1000"></textarea></div>
+        <div class="field"><label for="req-due">Due date <span class="hint">Optional</span></label><input id="req-due" type="date"></div>
+        <button type="submit" class="btn btn-outline btn-sm">Request document</button>
+        <div class="status" id="req-status" role="status" aria-live="polite"></div>
+      </form>
+    </section>
+
+    <section aria-labelledby="msg-h"><h3 id="msg-h">Message to applicant <span class="hint">The applicant WILL see these in Check my case</span></h3>
+      <form id="msg-form" novalidate>
+        <div class="field"><label for="msg-body">Message</label><textarea id="msg-body" maxlength="2000"></textarea></div>
+        <button type="submit" class="btn btn-outline btn-sm">Send update</button>
+        <div class="status" id="msg-status" role="status" aria-live="polite"></div>
+      </form>
+      <ol class="log" id="msg-log"><li>Loading…</li></ol>
+    </section>
+
+    <section aria-labelledby="log-h"><h3 id="log-h">Internal log <span class="hint">The applicant can NOT see this</span></h3>
+      <form id="note-form" novalidate>
+        <div class="field"><label for="note-kind">Entry type</label><select id="note-kind"><option value="note">Note</option><option value="contact_attempt">Contact attempt</option><option value="referral">Referral</option><option value="service">Service delivered</option></select></div>
+        <div class="field"><label for="note-body">Entry</label><textarea id="note-body" maxlength="5000"></textarea></div>
+        <button type="submit" class="btn btn-outline btn-sm">Add to log</button>
+        <div class="status" id="note-status" role="status" aria-live="polite"></div>
+      </form>
+      <ol class="log" id="log"><li>Loading…</li></ol>
+    </section>
+  </div></div>`;
+}
+function caseHeader(a){
+  $('#case-title').textContent=(a.preferred_name||a.full_name)+' · '+caseNo(a);
+  $('#case-sub').innerHTML='Applied '+esc(fmt(a.created_at))+' · '+esc(stageName(a.stage))+' '+badge(a.priority)+(a.preferred_name?' · Legal name: '+esc(a.full_name):'');
+}
+function syncClosedField(){$('#cm-closed-wrap').hidden=$('#cm-stage').value!=='closed'}
+async function loadNotes(id){
+  const ol=$('#log');if(!ol) return;
+  try{
+    const n=await api.notes(id);
+    ol.innerHTML=n.length?n.map(x=>`<li><div class="log-h"><strong>${esc(KIND[x.kind]||x.kind)}</strong> · ${esc(fmt(x.created_at,true))}${x.author?' · '+esc(x.author):''}</div><div class="pre">${esc(x.body)}</div></li>`).join(''):'<li>No entries yet.</li>';
+  }catch(e){if(e.auth) return authLost();ol.innerHTML='<li>Could not load the log.</li>'}
+}
+async function loadMsgs(id){
+  const ol=$('#msg-log');if(!ol) return;
+  try{
+    const n=await api.messages(id);
+    ol.innerHTML=n.length?n.map(x=>`<li><div class="log-h">${esc(fmt(x.created_at,true))}${x.author?' · '+esc(x.author):''}</div><div class="pre">${esc(x.body)}</div></li>`).join(''):'<li>No messages sent yet.</li>';
+  }catch(e){if(e.auth) return authLost();ol.innerHTML='<li>Could not load messages.</li>'}
+}
+function reqHTML(r){
+  const files=(r.case_documents||[]).slice().sort((a,b)=>a.uploaded_at.localeCompare(b.uploaded_at));
+  files.forEach(d=>state.docMap[d.id]=d);state.reqMap[r.id]=r;
+  return `<div class="docreq" data-rid="${esc(r.id)}">
+    <div class="card-top"><strong>${esc(r.title)}</strong><span class="badge ${r.status==='received'?'b-high':r.status==='accepted'?'b-ok':'b-none'}">${esc(RS[r.status]||r.status)}</span></div>
+    ${r.instructions?`<p class="meta pre">${esc(r.instructions)}</p>`:''}
+    ${r.due_date?`<p class="meta">Due ${esc(fmtDay(r.due_date))}</p>`:''}
+    <ul class="files">${files.map(d=>`<li><button type="button" class="linklike" data-doc="${esc(d.id)}">${esc(d.filename)}</button> <span class="meta">${esc(fmt(d.uploaded_at,true))}</span></li>`).join('')||'<li class="meta">No files uploaded yet.</li>'}</ul>
+    <div class="row">
+      <label for="rs-${esc(r.id)}" class="visually-hidden">Status for ${esc(r.title)}</label>
+      <select id="rs-${esc(r.id)}" class="rs">${Object.keys(RS).map(k=>`<option value="${k}"${k===r.status?' selected':''}>${RS[k]}</option>`).join('')}</select>
+      <label for="rr-${esc(r.id)}" class="visually-hidden">Reason shown to the applicant</label>
+      <input id="rr-${esc(r.id)}" type="text" class="rr" maxlength="500" placeholder="Reason shown to applicant (if asking to resend)" value="${esc(r.staff_reason||'')}">
+      <button type="button" class="btn btn-outline btn-sm rsave">Save</button>
+    </div></div>`;
+}
+async function loadDocs(id){
+  const el=$('#doc-list');if(!el) return;
+  try{
+    const reqs=await api.requests(id);
+    el.innerHTML=reqs.length?reqs.map(reqHTML).join(''):'<p class="meta">No documents requested yet.</p>';
+  }catch(e){if(e.auth) return authLost();el.innerHTML='<p class="status err">Could not load documents.</p>'}
+}
+function openCase(id){
+  const a=state.apps.find(x=>x.id===id);if(!a) return;
+  state.current=a;state.docMap={};state.reqMap={};caseHeader(a);
+  $('#case-body').innerHTML=caseHTML(a);syncClosedField();
+  $('#dlg-case').showModal();loadNotes(a.id);loadDocs(a.id);loadMsgs(a.id);
+}
+$('#dlg-case').addEventListener('close',()=>{
+  const id=state.current&&state.current.id;
+  const b=id&&$('[data-case="'+CSS.escape(id)+'"]');
+  (b||$('#staff-title')).focus();
+});
+const LABEL={stage:'Stage',priority:'Priority',assigned_to:'Assigned to',next_followup:'Next follow-up',closed_reason:'Closed reason'};
+function describeChanges(a,p){
+  const show=(k,v)=>k==='stage'?stageName(v):(v==null||v===''?'none':v);
+  return Object.keys(p).filter(k=>(a[k]==null?'':a[k])!==(p[k]==null?'':p[k])).map(k=>LABEL[k]+': '+show(k,a[k])+' → '+show(k,p[k]));
+}
+async function saveCase(){
+  const a=state.current,st=$('#cm-status');st.className='status';st.textContent='';
+  const stage=$('#cm-stage').value;
+  const p={stage,priority:$('#cm-priority').value,assigned_to:$('#cm-assigned').value.trim()||null,next_followup:$('#cm-follow').value||null,closed_reason:stage==='closed'?($('#cm-closed').value||null):null};
+  if(stage==='closed'&&!p.closed_reason){st.className='status err';st.textContent='Choose a reason for closing this case.';$('#cm-closed').focus();return}
+  const changes=describeChanges(a,p);
+  if(!changes.length){st.textContent='No changes to save.';return}
+  try{
+    await api.update(a.id,p);
+    await api.addNote({application_id:a.id,author:session.email,kind:'update',body:changes.join('; ')});
+    Object.assign(a,p,{updated_at:new Date().toISOString()});
+    caseHeader(a);renderBoard();loadNotes(a.id);
+    st.className='status ok';st.textContent='Saved.';
+  }catch(e){
+    if(e.auth) return authLost();
+    st.className='status err';st.textContent='Could not save. Check your connection and try again.';
+  }
+}
+async function addNote(){
+  const a=state.current,body=$('#note-body').value.trim(),st=$('#note-status');st.className='status';st.textContent='';
+  if(!body){st.className='status err';st.textContent='Write an entry before adding it.';$('#note-body').focus();return}
+  try{
+    await api.addNote({application_id:a.id,author:session.email,kind:$('#note-kind').value,body});
+    $('#note-body').value='';st.className='status ok';st.textContent='Added to the log.';loadNotes(a.id);
+  }catch(e){if(e.auth) return authLost();st.className='status err';st.textContent='Could not save the entry. Try again.'}
+}
+async function sendMsg(){
+  const a=state.current,body=$('#msg-body').value.trim(),st=$('#msg-status');st.className='status';st.textContent='';
+  if(!body){st.className='status err';st.textContent='Write a message first.';$('#msg-body').focus();return}
+  try{
+    await api.addMessage({application_id:a.id,author:session.email,body});
+    $('#msg-body').value='';st.className='status ok';st.textContent='Sent. The applicant will see it in Check my case.';loadMsgs(a.id);
+  }catch(e){if(e.auth) return authLost();st.className='status err';st.textContent='Could not send. Try again.'}
+}
+async function addRequest(){
+  const a=state.current,st=$('#req-status'),title=$('#req-title').value.trim();st.className='status';st.textContent='';
+  if(!title){st.className='status err';st.textContent='Enter what you need.';$('#req-title').focus();return}
+  try{
+    await api.addRequest({application_id:a.id,requested_by:session.email,title,instructions:$('#req-inst').value.trim()||null,due_date:$('#req-due').value||null});
+    await api.addNote({application_id:a.id,author:session.email,kind:'update',body:'Requested document: '+title});
+    ['req-title','req-inst','req-due'].forEach(i=>$('#'+i).value='');
+    st.className='status ok';st.textContent='Requested. The applicant will see it in Check my case.';
+    loadDocs(a.id);loadNotes(a.id);
+  }catch(e){if(e.auth) return authLost();st.className='status err';st.textContent='Could not save the request. Try again.'}
+}
+async function saveReview(box){
+  const id=box.dataset.rid,r=state.reqMap[id],status=$('.rs',box).value,reason=$('.rr',box).value.trim(),st=$('#doc-status');
+  st.className='status';st.textContent='';
+  if(status==='needs_retry'&&!reason){st.className='status err';st.textContent='Add a short reason so the applicant knows what to fix.';$('.rr',box).focus();return}
+  try{
+    await api.updateRequest(id,{status,staff_reason:status==='needs_retry'?reason:null});
+    await api.addNote({application_id:state.current.id,author:session.email,kind:'update',body:'Document "'+r.title+'": '+(RS[r.status]||r.status)+' → '+RS[status]});
+    st.className='status ok';st.textContent='Saved.';
+    await loadDocs(state.current.id);loadNotes(state.current.id);refreshReview();
+  }catch(e){if(e.auth) return authLost();st.className='status err';st.textContent='Could not save. Try again.'}
+}
+async function viewDoc(id){
+  const d=state.docMap[id],st=$('#doc-status');if(!d) return;
+  const w=window.open('about:blank','_blank');if(w) w.opener=null;
+  try{
+    const u=await api.docUrl(d);
+    if(w) w.location.href=u;else{st.className='status err';st.textContent='Your browser blocked the pop-up. Allow pop-ups for this page and try again.'}
+  }catch(e){if(w) w.close();if(e.auth) return authLost();st.className='status err';st.textContent='Could not open the file.'}
+}
+async function resetCode(){
+  const a=state.current,out=$('#reset-result');out.className='status';out.textContent='';
+  try{
+    const code=await api.resetCode(a.id);
+    out.className='status ok';
+    out.innerHTML='New access code: <span class="big" aria-hidden="true">'+esc(code)+'</span><span class="visually-hidden">'+esc(spell(code))+'</span><br>Share it only after confirming who you are talking to. It will not be shown again.';
+    $('#reset-confirm').hidden=true;loadNotes(a.id);
+  }catch(e){if(e.auth) return authLost();out.className='status err';out.textContent='Could not reset the code. Try again.'}
+}
+const cb=$('#case-body');
+cb.addEventListener('submit',e=>{
+  e.preventDefault();
+  if(e.target.id==='cm-form') saveCase();
+  else if(e.target.id==='note-form') addNote();
+  else if(e.target.id==='msg-form') sendMsg();
+  else if(e.target.id==='req-form') addRequest();
+});
+cb.addEventListener('change',e=>{if(e.target.id==='cm-stage') syncClosedField()});
+cb.addEventListener('click',e=>{
+  const t=e.target;
+  if(t.id==='btn-assign-me') $('#cm-assigned').value=session.email;
+  else if(t.id==='btn-advance'){
+    const k=t.dataset.next;$('#cm-stage').value=k;syncClosedField();
+    if(k==='closed') $('#cm-closed').focus();else saveCase();
+  }
+  else if(t.id==='btn-reset'){$('#reset-confirm').hidden=false;$('#btn-reset-no').focus()}
+  else if(t.id==='btn-reset-no'){$('#reset-confirm').hidden=true;$('#btn-reset').focus()}
+  else if(t.id==='btn-reset-yes') resetCode();
+  else if(t.closest('[data-doc]')) viewDoc(t.closest('[data-doc]').dataset.doc);
+  else if(t.closest('.rsave')) saveReview(t.closest('.docreq'));
+});
+
+/* ----- Demo helpers ----- */
+async function seedDemo(){
+  const d=n=>new Date(Date.now()-n*864e5).toISOString(),day=n=>new Date(Date.now()+n*864e5).toLocaleDateString('en-CA');
+  const base={language:'English',consent:true,homeless_duration:null,household_adults:1,household_children:0,accommodations:null,contact_notes:null,email:null,assigned_to:null,next_followup:null,closed_reason:null,access_code:'SAMPLE2345'};
+  const pet=(name,type,size)=>({name,type,size,age:'',vaccinated:'Yes',fixed:'Yes',notes:''});
+  const rows=[
+   Object.assign({},base,{full_name:'Sample: Maria L.',contact_method:'Text message',phone:'555-0101',area:'Downtown area',sleeping_location:'Vehicle',unsafe_now:true,pets:[pet('Luna','Dog','Medium (25 to 60 lb)')],needs:['Shelter','Food for my pet'],needs_detail:'Sleeping in my car with my dog. We need a safe place tonight.',stage:'new',priority:'urgent',created_at:d(0)}),
+   Object.assign({},base,{full_name:'Sample: James R.',contact_method:'Phone call',phone:'555-0102',area:'Near the river trail',sleeping_location:'Tent or encampment',unsafe_now:false,pets:[pet('Miso','Cat','Small (under 25 lb)')],needs:['Shelter','Vet care'],stage:'contacting',priority:'high',assigned_to:'demo@preview',created_at:d(2)}),
+   Object.assign({},base,{full_name:'Sample: Dana K.',contact_method:'Email',email:'dana@example.org',area:'Eastside',sleeping_location:'With friends or family',unsafe_now:false,pets:[pet('Bear','Dog','Large (over 60 lb)'),pet('Pip','Cat','Small (under 25 lb)')],needs:['Pet supplies','Food for my pet','Transportation','Vet care'],stage:'active',priority:'normal',next_followup:day(-1),created_at:d(6)}),
+   Object.assign({},base,{full_name:'Sample: Chris T.',contact_method:'Through someone else',contact_notes:'Reach through the case worker at the day center.',area:'Westside',sleeping_location:'Shelter',unsafe_now:false,pets:[pet('Scout','Dog','Medium (25 to 60 lb)')],needs:['Housing help','ID and documents'],stage:'housing',priority:'normal',assigned_to:'demo@preview',next_followup:day(5),created_at:d(20)})
+  ];
+  const ids=[];
+  for(let i=0;i<rows.length;i++){const r=rows[i];r.id=uuid();r.doc_folder=uuid();r.case_number='AYR-26-9000'+(i+1);r.updated_at=r.created_at;ids.push(r.id);await demoApi._put('app:'+r.id,r)}
+  const rid=uuid(),rid2=uuid();
+  await demoApi._put('req:'+ids[1]+':'+rid,{id:rid,application_id:ids[1],created_at:d(1),requested_by:'demo@preview',title:'Pet vaccination record',instructions:'A photo of the vet paperwork is fine.',due_date:day(3),status:'requested',staff_reason:null});
+  await demoApi._put('req:'+ids[2]+':'+rid2,{id:rid2,application_id:ids[2],created_at:d(5),requested_by:'demo@preview',title:'Photo of my pet',instructions:null,due_date:null,status:'accepted',staff_reason:null});
+  await demoApi.addMessage({application_id:ids[1],author:'demo@preview',body:'We left you a voicemail. Please call or text us back when you can.'});
+  await demoApi.addNote({application_id:ids[1],author:'demo@preview',kind:'contact_attempt',body:'Left a voicemail. Will try again tomorrow.'});
+  $('#demo-hint').textContent='Sample cases use the access code SAMPL-E2345. Try case AYR-26-90002 under "Check my case".';
+  await loadApps();
+}
+$('#btn-seed').addEventListener('click',seedDemo);
+$('#btn-clear').addEventListener('click',async()=>{await demoApi.clear();$('#demo-hint').textContent='';await loadApps()});
+
+/* ================= START ================= */
+resetPets();
+route(true);
+</script>
+</body>
+</html>
